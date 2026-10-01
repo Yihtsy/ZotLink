@@ -4,7 +4,7 @@ ZotLink 是一个面向 Zotero 10 的 Windows 链接附件管理插件，主要�
 
 ZotLink 会把 PDF 文件放在可直接浏览、可独立使用的文件夹体系中，同时为 Zotero 记录稳定的文件身份，减少“Zotero 能看到条目，但附件文件已经找不到”的情况。
 
-当前版本：`0.3.2`
+当前版本：`0.3.3`
 
 作者：Yihtsy <yihtsy@outlook.com>
 
@@ -24,7 +24,7 @@ ZotLink 会把 PDF 文件放在可直接浏览、可独立使用的文件夹体�
 
 ## 使用方式
 
-1. 在 Zotero 插件管理器中安装 `zotlink-0.3.2.xpi`。
+1. 在 Zotero 插件管理器中安装 `zotlink-0.3.3.xpi`。
 2. 重启 Zotero。
 3. 在 ZotLink 设置中填写附件移动顶层路径，例如 `D:\OneDrive\Zotero`。
 4. 选中文献条目或附件，使用右键菜单 `ZotLink -> 移动附件到集合目录`。

@@ -1064,11 +1064,6 @@
 			repairAttachmentsItem.addEventListener("command", () => this.repairSelectedAttachmentLinksByFileID());
 			popup.appendChild(repairAttachmentsItem);
 
-			let reloadItem = doc.createXULElement("menuitem");
-			reloadItem.setAttribute("label", "重新加载 ZotLink 设置");
-			reloadItem.addEventListener("command", () => this.reloadSettings());
-			popup.appendChild(reloadItem);
-
 			menu.appendChild(root);
 			this._menuElements.push(root);
 		},
@@ -3093,6 +3088,20 @@
 
 		async ensureShortcutPath(targetPath, shortcutPath, diagnostics = []) {
 			await IOUtils.makeDirectory(this.getParentPath(shortcutPath), { createAncestors: true });
+			let renamedShortcut = await this.findShortcutByTargetInDirectory(this.getParentPath(shortcutPath), targetPath, diagnostics);
+			if (renamedShortcut && !this.pathsEqual(renamedShortcut, shortcutPath)) {
+				try {
+					if (await IOUtils.exists(shortcutPath)) {
+						await IOUtils.remove(shortcutPath);
+					}
+					await IOUtils.move(renamedShortcut, shortcutPath);
+					return shortcutPath;
+				}
+				catch (e) {
+					Zotero.logError(e);
+					diagnostics.push(`重命名快捷方式失败：${renamedShortcut} -> ${shortcutPath}；${e.message || e}`);
+				}
+			}
 			let needsUpdate = true;
 			if (await IOUtils.exists(shortcutPath)) {
 				let currentTarget = await this.getShortcutTargetPath(shortcutPath, diagnostics);
@@ -3148,6 +3157,30 @@
 					Zotero.logError(e);
 				}
 			}
+		},
+
+		async findShortcutByTargetInDirectory(dir, targetPath, diagnostics = []) {
+			if (!dir || !(await IOUtils.exists(dir))) {
+				return "";
+			}
+			let children;
+			try {
+				children = await IOUtils.getChildren(dir);
+			}
+			catch (e) {
+				Zotero.logError(e);
+				return "";
+			}
+			for (let child of children) {
+				if (!/\.lnk$/i.test(child || "")) {
+					continue;
+				}
+				let shortcutTarget = await this.getShortcutTargetPath(child, diagnostics);
+				if (this.pathsEqual(shortcutTarget, targetPath)) {
+					return child;
+				}
+			}
+			return "";
 		},
 
 		async getShortcutTargetPath(shortcutPath, diagnostics = []) {
