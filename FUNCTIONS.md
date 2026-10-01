@@ -87,6 +87,16 @@ extensions.zotlink.attachmentFileIndex
 - 将 PDF 作为链接附件添加到该条目。
 - 创建附件后立即记录机内码。
 
+## 从顶层文件夹重建链接库
+
+- 设置页新增 `从顶层文件夹重建链接库` 按钮。
+- 从 `attachmentMoveRoot` 开始递归扫描所有子文件夹中的 PDF。
+- 读取 PDF metadata 中的 DOI；没有 DOI 的 PDF 会跳过。
+- 如果当前 Zotero 个人库中已经存在相同 DOI 的未删除条目，则跳过，避免重复导入。
+- 按磁盘相对路径自动创建或匹配 Zotero collection 层级。
+- 成功识别 DOI 的 PDF 会通过 Zotero 搜索翻译器创建条目，并作为链接附件加入对应 collection。
+- 这个功能用于在 OneDrive 等同步盘中保留固定 PDF 文件夹结构，并在跨机器迁移后快速重建 Zotero 链接附件库。
+
 ## PDF DOI 元数据写回与页码对齐
 
 - 新增/导入 PDF 文件附件后，ZotLink 会读取父条目的 DOI。

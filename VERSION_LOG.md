@@ -1,6 +1,15 @@
 # ZotLink 版本记录
 
-## 当前版本：0.3.4
+## 当前版本：0.3.5
+
+### 本版变化
+
+- README 改为英文为主、中文在后的双语结构；移除顶部版本/作者/邮箱文字，改用 release、license、Zotero badges。
+- README 中 Attanger、ZotFile、ZotMoov 链接改为项目 GitHub 首页。
+- 新增设置页按钮 `从顶层文件夹重建链接库`：递归扫描附件顶层路径下所有 PDF，读取 DOI metadata，跳过库中已有 DOI，并按文件夹结构创建 collection 与链接附件。
+- 新增 MIT license，并把 `LICENSE` 纳入 XPI 构建。
+
+## 0.3.4
 
 ### 本版变化
 

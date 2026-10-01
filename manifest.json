@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "ZotLink",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Moves Zotero linked attachments, mirrors collections with shortcuts, and repairs links by Windows file ID.",
   "author": "Yihtsy <yihtsy@outlook.com>",
   "homepage_url": "https://github.com/Yihtsy/ZotLink",
