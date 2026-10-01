@@ -1,18 +1,12 @@
 # ZotLink
 
-ZotLink 是一个面向 Zotero 10 的 Windows 链接附件管理插件。它主要服务于喜欢使用链接附件、希望 PDF 文件独立保存在普通文件夹中的用户；如果你更喜欢把 PDF 作为 Zotero storage 内的文件附件管理，ZotLink 可能并不适合你的工作流。
+ZotLink 是一个面向 Zotero 10 的 Windows 链接附件管理插件，主要服务于喜欢使用链接附件、希望 PDF 文件独立保存在普通文件夹中的用户。
 
 ZotLink 会把 PDF 文件放在可直接浏览、可独立使用的文件夹体系中，同时为 Zotero 记录稳定的文件身份，减少“Zotero 能看到条目，但附件文件已经找不到”的情况。
 
-当前版本：`0.3.0`
+当前版本：`0.3.1`
 
 作者：Yihtsy <yihtsy@outlook.com>
-
-## 为什么做 ZotLink
-
-Zotero 原生链接附件只记录一个附件路径。用户如果在资源管理器、Everything、同步盘或其他文件管理器中重命名、移动 PDF，Zotero 记录的路径就可能失效；而很多人又希望 PDF 文件不被锁在 Zotero storage 里，而是仍然能作为普通文件独立使用、搜索、同步、备份和整理。
-
-ZotLink 的目标是让 Zotero 与外部文件系统协作，而不是让其中一方完全接管另一方。
 
 ## 核心特性
 
@@ -23,48 +17,22 @@ ZotLink 的目标是让 Zotero 与外部文件系统协作，而不是让其中�
 - 一个条目属于多个 collections 时，ZotLink 会保留一份真实 PDF，并在其他 collection 文件夹中创建 `.lnk` 快捷方式分身。
 - 支持主文件与快捷方式分身换位：Shift+拖拽条目到其他 collection 时，真实文件会移动到新 collection 对应目录，其他目录刷新为快捷方式。
 - 支持从左侧 collection 对应文件夹批量导入 PDF，并按 PDF metadata DOI 创建 Zotero 条目。
-- 支持把父条目的 DOI 写入 PDF 源文件 metadata：`/doi` 与 `/doiURL`。
+- 支持把父条目的 DOI 写入 PDF 源文件 metadata：`/doi` 与 `/doiURL`；已有字段不会覆盖，只补写缺失字段。
 - 支持按规则重命名主 PDF，例如 `{author} {year} {title}`，默认不启用。
 - 支持初始化全库附件机内码。
 
-## 0.3.0 重要变化
+## 使用方式
 
-`0.3.0` 是 ZotLink 的第一个正式大版本发布准备版，也是一项会修改 PDF 源文件的大改动：
+1. 在 Zotero 插件管理器中安装 `zotlink-0.3.1.xpi`。
+2. 重启 Zotero。
+3. 在 ZotLink 设置中填写附件移动顶层路径，例如 `D:\OneDrive\Zotero`。
+4. 选中文献条目或附件，使用右键菜单 `ZotLink -> 移动附件到集合目录`。
+5. 普通拖拽条目到另一个 collection：保留真实文件主路径，并在新增 collection 目录创建 `.lnk`。
+6. Shift+拖拽条目到另一个 collection：移动真实文件到新 collection 目录，并刷新其他 `.lnk`。
 
-- PDF DOI metadata 写回成为正式功能：当父条目存在 DOI 时，ZotLink 可向 PDF 源文件补写 `/doi` 与 `/doiURL`。
-- 如果 PDF 已经同时存在 `/doi` 和 `/doiURL`，ZotLink 会跳过，不覆盖已有 metadata。
-- 如果只存在其中一个字段，ZotLink 会补写缺失字段。
-- 新增可配置的主 PDF 重命名功能，默认关闭。
-- 条目右键菜单 `ZotLink -> 按规则重命名主 PDF` 可手动执行重命名。
-- 右键普通条目时，只处理该条目的主 PDF；右键具体 PDF 附件时，只处理该附件。
+## 功能介绍
 
-建议首次使用 `0.3.0` 的 PDF 写回和重命名前，先备份附件目录或使用同步盘历史版本。
-
-## 与 Attanger、ZotFile、ZotMoov 的区别
-
-### Attanger
-
-[Attanger](https://github.com/MuiseDestiny/zotero-attanger) 是目前仍活跃的 Zotero 附件管理插件，重点包括附件移动、复制、重命名、匹配最近下载文件，以及使用 Zotero 原生重命名模板等。Attanger 更接近通用附件整理器。
-
-ZotLink 的重点不同：
-
-- 以 Windows 文件身份为核心，记录机内码与路径。
-- 优先解决“外部改名或移动后，Zotero 附件脱钩”的问题。
-- 面向 Zotero collection 与外部文件夹长期保持对应关系。
-- 多 collection 场景使用真实文件加 `.lnk` 镜像，而不是让 Zotero 绑定多个真实路径。
-- 支持把 DOI 写回 PDF metadata，让 PDF 离开 Zotero 后仍带有可读的标识信息。
-
-### ZotFile
-
-[ZotFile](https://github.com/jlegewie/zotfile/blob/master/readme.md) 是 Zotero 附件管理的经典前辈，曾提供 PDF 重命名、移动、平板同步、注释提取等功能。它的 README 已说明项目当前不再积极维护，更新很少。ZotLink 借鉴的是“让附件脱离 storage、进入可读文件夹”的思路，但实现目标更窄：专注链接附件、collection 路径、文件身份索引和链接修复。
-
-### ZotMoov
-
-[ZotMoov](https://github.com/wileyyugioh/zotmoov/blob/master/README.md) 是 Zotero 7 时代的轻量附件移动工具。ZotLink 与 ZotMoov 的一个关键差异是：ZotLink 尽量使用移动操作处理附件迁移，而不是“复制到目标位置后删除原文件”。在同一个 NTFS 卷内移动时，文件机内码通常保持不变，因此更适合 ZotLink 的文件身份追踪。
-
-ZotLink 还额外记录机内码与附件路径，用于处理用户在资源管理器中改名、移动 PDF 后 Zotero 链接失效的问题。
-
-## 多重 Collection 与快捷方式分身
+### 多重 Collection 与快捷方式分身
 
 Zotero 的一个附件条目只能绑定一个真实文件路径，但一个文献条目常常会同时属于多个 collections。ZotLink 的处理方式是：
 
@@ -77,7 +45,7 @@ Zotero 的一个附件条目只能绑定一个真实文件路径，但一个文�
 
 这样做的目的，是让同一个 Zotero 条目可以自然出现在多个 collection 文件夹中，同时避免真的复制多份 PDF。
 
-### 为什么没有选择硬链接
+#### 为什么没有选择硬链接
 
 ZotLink 曾认真考虑过硬链接模式：同一个文件实体可以出现在多个 collection 文件夹中，且机内码相同。这个方案技术上可行，也能减少真实文件重复。
 
@@ -91,16 +59,7 @@ ZotLink 曾认真考虑过硬链接模式：同一个文件实体可以出现在
 
 硬链接相关代码仍保留在源码中作为 legacy/reference，方便以后研究或开源后供他人参考。
 
-## 使用方式
-
-1. 在 Zotero 插件管理器中安装 `zotlink-0.3.0.xpi`。
-2. 重启 Zotero。
-3. 在 ZotLink 设置中填写附件移动顶层路径，例如 `D:\OneDrive\Zotero`。
-4. 选中文献条目或附件，使用右键菜单 `ZotLink -> 移动附件到集合目录`。
-5. 普通拖拽条目到另一个 collection：保留真实文件主路径，并在新增 collection 目录创建 `.lnk`。
-6. Shift+拖拽条目到另一个 collection：移动真实文件到新 collection 目录，并刷新其他 `.lnk`。
-
-## PDF 重命名
+### PDF 重命名
 
 设置页提供：
 
@@ -125,7 +84,7 @@ PDF 重命名规则
 
 自动重命名默认关闭。启用后，ZotLink 只会在新增或同步流程中重命名主 PDF，不会批量改动同一条目下的全部 PDF。也可以通过条目右键菜单 `ZotLink -> 按规则重命名主 PDF` 手动执行。
 
-## 从 Collection 文件夹批量导入 PDF
+### 从 Collection 文件夹批量导入 PDF
 
 在 Zotero 左侧 collection 上右键，选择：
 
@@ -142,7 +101,7 @@ ZotLink -> 导入当前文件夹及子文件夹 PDF
 
 如果目标 collection 中已经存在相同 DOI 的条目，ZotLink 会跳过该 PDF。当前版本不会做全文识别；如果 DOI 不在 metadata 或轻量扫描范围内，会跳过。
 
-## PDF DOI 元数据写回
+### PDF DOI 元数据写回
 
 ZotLink 会在附件同步流程中尝试把父条目的 DOI 写入 PDF 源文件 metadata：
 
@@ -159,7 +118,7 @@ ZotLink 会在附件同步流程中尝试把父条目的 DOI 写入 PDF 源文�
 - 右键普通条目时，只处理该条目的主 PDF。
 - 右键具体 PDF 附件时，只处理该附件。
 
-## 索引数据
+### 索引数据
 
 ZotLink 将附件索引存储在 Zotero preferences：
 
@@ -175,30 +134,28 @@ extensions.zotlink.attachmentFileIndex
 - `path`：兼容旧版本的主路径字段，等同于 `primaryPath`。
 - `hardlinkPaths`：旧硬链接模式遗留字段，`0.2.0` 会逐步清理。
 
-## 发布说明
+## 为什么做 ZotLink
 
-GitHub Release 建议包含：
+Zotero 原生链接附件只记录一个附件路径。用户如果在资源管理器、Everything、同步盘或其他文件管理器中重命名、移动 PDF，Zotero 记录的路径就可能失效；而很多人又希望 PDF 文件不被锁在 Zotero storage 里，而是仍然能作为普通文件独立使用、搜索、同步、备份和整理。
 
-- `zotlink-0.3.0.xpi`
-- `updates.json`
-- `README.md`
-- `VERSION_LOG.md`
+ZotLink 的目标是让 Zotero 与外部文件系统协作，而不是让其中一方完全接管另一方。
 
-Zotero 插件市场说明建议突出：
+### 与 Attanger、ZotFile、ZotMoov 的区别
 
-- Windows 链接附件管理。
-- 文件机内码与路径双重索引。
-- 外部改名或移动后的附件修复。
-- Collection 文件夹镜像。
-- PDF DOI metadata 写回。
-- 可选主 PDF 自动重命名。
+[ZotMoov](https://github.com/wileyyugioh/zotmoov/blob/master/README.md) 是 Zotero 7 时代的轻量附件移动工具。ZotLink 与 ZotMoov 的一个关键差异是：ZotLink 尽量使用移动操作处理附件迁移，而不是“复制到目标位置后删除原文件”。在同一个 NTFS 卷内移动时，文件机内码通常保持不变，因此更适合 ZotLink 的文件身份追踪。
+
+ZotLink 还额外记录机内码与附件路径，用于处理用户在资源管理器中改名、移动 PDF 后 Zotero 链接失效的问题。多 collection 场景下，ZotLink 也更强调“一个真实 PDF + 多个快捷方式分身”的文件夹组织方式。
+
+[Attanger](https://github.com/MuiseDestiny/zotero-attanger) 是目前仍活跃的 Zotero 附件管理插件，更接近通用附件整理器，支持附件移动、复制、重命名、匹配最近下载文件，以及使用 Zotero 原生重命名模板等。ZotLink 的定位更窄，主要围绕 Windows 文件身份、链接修复、collection 文件夹映射和多 collection 快捷方式分身。
+
+[ZotFile](https://github.com/jlegewie/zotfile/blob/master/readme.md) 是 Zotero 附件管理的经典前辈，曾提供 PDF 重命名、移动、平板同步、注释提取等功能。ZotLink 借鉴的是“让附件脱离 storage、进入可读文件夹”的思路，但实现目标更聚焦于 Zotero 10 的链接附件工作流。
 
 ## 注意事项
 
 - ZotLink 当前主要面向 Windows，因为机内码、`.lnk` 和 NTFS 移动语义都依赖 Windows。
 - ZotLink 面向链接附件工作流；偏好 Zotero storage 文件附件、并希望文件始终留在 Zotero storage 内的用户，可能不适合使用本插件。
 - `.lnk` 快捷方式不是 Zotero 附件本体；Zotero 仍只绑定真实文件路径。
-- `0.3.0` 的 DOI metadata 写回会修改 PDF 源文件，请在首次全库执行前备份附件目录。
+- PDF DOI metadata 写回会修改 PDF 源文件，请在首次全库执行前备份附件目录。
 - OneDrive 等同步盘可能会短暂显示同步中的临时状态，但 ZotLink 的真实文件迁移仍使用移动操作。
 
 ## 版本记录

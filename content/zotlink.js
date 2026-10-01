@@ -347,9 +347,11 @@
 				}
 			}
 
-			for (let item of Zotero.getActiveZoteroPane?.()?.getSelectedItems?.() || []) {
-				if (item?.isRegularItem?.() || item?.isAttachment?.()) {
-					this.addPossibleItemID(itemIDs, item.id);
+			if (event !== "delete" && event !== "remove") {
+				for (let item of Zotero.getActiveZoteroPane?.()?.getSelectedItems?.() || []) {
+					if (item?.isRegularItem?.() || item?.isAttachment?.()) {
+						this.addPossibleItemID(itemIDs, item.id);
+					}
 				}
 			}
 			return Array.from(itemIDs);
