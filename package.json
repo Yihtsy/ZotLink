@@ -1,0 +1,10 @@
+{
+  "name": "zotlink",
+  "version": "0.3.0",
+  "private": true,
+  "author": "Yihtsy <yihtsy@outlook.com>",
+  "description": "Zotero plugin for linked attachment moving, shortcut mirrors, and link repair.",
+  "scripts": {
+    "build": "node scripts/build-xpi.js"
+  }
+}

@@ -1,0 +1,66 @@
+<vbox xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+      xmlns:html="http://www.w3.org/1999/xhtml"
+      onload="Zotero.ZotLink.initializePreferencePane(document);"
+      onpageshow="Zotero.ZotLink.initializePreferencePane(document);">
+	<linkset>
+		<html:link rel="localization" href="zotlink.ftl"/>
+	</linkset>
+
+	<groupbox>
+		<label><html:h2>ZotLink 附件移动</html:h2></label>
+		<label>按当前集合层级移动选中文献的文件附件，并同步更新 Zotero 的链接附件路径。</label>
+		<grid>
+			<columns>
+				<column/>
+				<column flex="1"/>
+			</columns>
+			<rows>
+				<row align="center">
+					<label value="顶层路径"/>
+					<html:input id="zotlink-move-root"
+					            style="width: 100%; box-sizing: border-box;"
+					            placeholder="D:\OneDrive\Zotero"/>
+				</row>
+				<row align="center">
+					<label value="快捷键"/>
+					<hbox align="center">
+						<html:input id="zotlink-move-shortcut"
+						            style="width: 220px; box-sizing: border-box;"
+						            placeholder="点击后按快捷键，如 Ctrl+Alt+M"
+						            onkeydown="Zotero.ZotLink.captureShortcutInput(event, this);"/>
+						<label id="zotlink-current-shortcut"
+						       value=""
+						       style="margin-left: 8px;"/>
+					</hbox>
+				</row>
+				<row align="center">
+					<label value="自动重命名"/>
+					<hbox align="center">
+						<checkbox id="zotlink-auto-rename-enabled"
+						          label="为新增或同步的主 PDF 按规则重命名"/>
+					</hbox>
+				</row>
+				<row align="center">
+					<label value="改名规则"/>
+					<html:input id="zotlink-rename-pattern"
+					            style="width: 100%; box-sizing: border-box;"
+					            placeholder="{author} {year} {title}"/>
+				</row>
+			</rows>
+		</grid>
+		<hbox style="margin-top: 8px;">
+			<button id="zotlink-save-attachment-settings"
+			        label="保存附件移动设置"
+			        oncommand="Zotero.ZotLink.handlePreferenceAction('saveAttachmentSettings', this);"/>
+			<button id="zotlink-index-all-attachments"
+			        label="初始化全库附件机内码"
+			        oncommand="Zotero.ZotLink.handlePreferenceAction('indexAllAttachments', this);"/>
+			<button id="zotlink-write-all-pdf-doi-metadata"
+			        label="写入全库 PDF DOI 元数据"
+			        oncommand="Zotero.ZotLink.handlePreferenceAction('writeAllPDFDOIMetadata', this);"/>
+			<button id="zotlink-show-last-move-report"
+			        label="查看上次移动结果"
+			        oncommand="Zotero.ZotLink.handlePreferenceAction('showLastMoveReport', this);"/>
+		</hbox>
+	</groupbox>
+</vbox>
