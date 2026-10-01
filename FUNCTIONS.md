@@ -91,7 +91,8 @@ extensions.zotlink.attachmentFileIndex
 
 - 新增/导入 PDF 文件附件后，ZotLink 会读取父条目的 DOI。
 - 如果父条目存在 DOI，且 PDF 源文件中缺少 `/doi` 或 `/doiURL`，则通过 Python `pikepdf` 补写缺失字段。
-- 如果 PDF 已经同时存在 `/doi` 和 `/doiURL`，则跳过，不覆盖已有 metadata。
+- 如果 PDF 已经同时存在且匹配的 `/doi` 和 `/doiURL`，则跳过，不覆盖已有 metadata。
+- 如果 PDF 已经同时存在 `/doi` 和 `/doiURL`，但 `/doiURL` 与 `/doi` 不一致，则以 `/doi` 为准覆盖 `/doiURL`。
 - 设置页提供 `写入全库 PDF DOI 元数据并对齐页码` 按钮，可对当前个人库中的 PDF 附件统一执行一次。
 - 条目右键菜单新增 `ZotLink -> 写入 PDF DOI 元数据`，右键普通条目时只处理主 PDF，右键具体 PDF 附件时只处理该附件。
 - 如果 Python 环境缺少 `pikepdf`，会跳过并在结果中说明。

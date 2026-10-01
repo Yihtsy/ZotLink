@@ -4,7 +4,7 @@ ZotLink 是一个面向 Zotero 10 的 Windows 链接附件管理插件，主要�
 
 ZotLink 会把 PDF 文件放在可直接浏览、可独立使用的文件夹体系中，同时为 Zotero 记录稳定的文件身份，减少“Zotero 能看到条目，但附件文件已经找不到”的情况。
 
-当前版本：`0.3.3`
+当前版本：`0.3.4`
 
 作者：Yihtsy <yihtsy@outlook.com>
 
@@ -17,14 +17,14 @@ ZotLink 会把 PDF 文件放在可直接浏览、可独立使用的文件夹体�
 - 一个条目属于多个 collections 时，ZotLink 会保留一份真实 PDF，并在其他 collection 文件夹中创建 `.lnk` 快捷方式分身。
 - 支持主文件与快捷方式分身换位：Shift+拖拽条目到其他 collection 时，真实文件会移动到新 collection 对应目录，其他目录刷新为快捷方式。
 - 支持从左侧 collection 对应文件夹批量导入 PDF，并按 PDF metadata DOI 创建 Zotero 条目。
-- 支持把父条目的 DOI 写入 PDF 源文件 metadata：`/doi` 与 `/doiURL`；已有字段不会覆盖，只补写缺失字段。
+- 支持把父条目的 DOI 写入 PDF 源文件 metadata：`/doi` 与 `/doiURL`；已有 `/doi` 不会覆盖，`/doiURL` 会按 `/doi` 自动补齐或纠正。
 - 支持按 Zotero 条目的常规页码范围对齐主 PDF 的页码标签。
 - 支持按规则重命名主 PDF，例如 `{author} {year} {title}`，默认不启用。
 - 支持初始化全库附件机内码。
 
 ## 使用方式
 
-1. 在 Zotero 插件管理器中安装 `zotlink-0.3.3.xpi`。
+1. 在 Zotero 插件管理器中安装 `zotlink-0.3.4.xpi`。
 2. 重启 Zotero。
 3. 在 ZotLink 设置中填写附件移动顶层路径，例如 `D:\OneDrive\Zotero`。
 4. 选中文献条目或附件，使用右键菜单 `ZotLink -> 移动附件到集合目录`。
@@ -109,8 +109,9 @@ ZotLink 会在附件同步流程中尝试把父条目的 DOI 写入 PDF 源文�
 - 写入字段：`/doi` 与 `/doiURL`。
 - 写入工具：通过 Python 调用 `pikepdf`。
 - 触发时机：新增/导入 PDF 文件附件、storage 附件被移出并转为链接附件、附件路径同步后。
-- 跳过条件：父条目没有 DOI、附件不是 PDF、源文件不存在，或 PDF 中已经同时存在 `/doi` 和 `/doiURL`。
+- 跳过条件：父条目没有 DOI、附件不是 PDF、源文件不存在，或 PDF 中已经同时存在且匹配的 `/doi` 和 `/doiURL`。
 - 若 PDF 中已有 `/doi` 但缺少 `/doiURL`，ZotLink 会只补写 `/doiURL`；反过来也一样。
+- 若 PDF 中 `/doi` 和 `/doiURL` 都存在但不一致，ZotLink 会以 `/doi` 为准覆盖 `/doiURL`。
 
 ZotLink 也会尝试按父条目的 `pages` 字段对齐主 PDF 的页码标签。只有 `10-18`、`S10-S18` 这类带连字符的常规页码范围会被处理；文章号或没有连字符的页码值会跳过。
 
