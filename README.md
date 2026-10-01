@@ -1,6 +1,8 @@
 # ZotLink
 
-ZotLink 是一个面向 Zotero 7 的 Windows 链接附件管理插件。它把 PDF 文件放在可直接浏览、可独立使用的文件夹体系中，同时为 Zotero 记录稳定的文件身份，减少“Zotero 能看到条目，但附件文件已经找不到”的情况。
+ZotLink 是一个面向 Zotero 10 的 Windows 链接附件管理插件。它主要服务于喜欢使用链接附件、希望 PDF 文件独立保存在普通文件夹中的用户；如果你更喜欢把 PDF 作为 Zotero storage 内的文件附件管理，ZotLink 可能并不适合你的工作流。
+
+ZotLink 会把 PDF 文件放在可直接浏览、可独立使用的文件夹体系中，同时为 Zotero 记录稳定的文件身份，减少“Zotero 能看到条目，但附件文件已经找不到”的情况。
 
 当前版本：`0.3.0`
 
@@ -18,8 +20,8 @@ ZotLink 的目标是让 Zotero 与外部文件系统协作，而不是让其中�
 - 以复制形式拖入 Zotero storage 的文件附件，会自动移出到指定目录并改为链接附件。
 - 使用 Windows 机内码和附件路径双重记录真实文件身份。
 - 打开或定位附件前，如果 Zotero 记录路径失效，会尝试按机内码找回真实文件。
-- 一个条目属于多个 collections 时，Zotero 仍只绑定一个真实附件路径，其他 collection 目录下创建 `.lnk` 快捷方式。
-- Shift+拖拽条目到其他 collection 时，真实文件会移动到新 collection 对应目录。
+- 一个条目属于多个 collections 时，ZotLink 会保留一份真实 PDF，并在其他 collection 文件夹中创建 `.lnk` 快捷方式分身。
+- 支持主文件与快捷方式分身换位：Shift+拖拽条目到其他 collection 时，真实文件会移动到新 collection 对应目录，其他目录刷新为快捷方式。
 - 支持从左侧 collection 对应文件夹批量导入 PDF，并按 PDF metadata DOI 创建 Zotero 条目。
 - 支持把父条目的 DOI 写入 PDF 源文件 metadata：`/doi` 与 `/doiURL`。
 - 支持按规则重命名主 PDF，例如 `{author} {year} {title}`，默认不启用。
@@ -62,17 +64,30 @@ ZotLink 的重点不同：
 
 ZotLink 还额外记录机内码与附件路径，用于处理用户在资源管理器中改名、移动 PDF 后 Zotero 链接失效的问题。
 
-## 为什么没有选择硬链接
+## 多重 Collection 与快捷方式分身
 
-ZotLink 曾在 `0.1.15` 使用硬链接模式处理多 collection 场景：同一个文件实体可以出现在多个 collection 文件夹中，且机内码相同。这个方案技术上可行，也能减少真实文件重复。
+Zotero 的一个附件条目只能绑定一个真实文件路径，但一个文献条目常常会同时属于多个 collections。ZotLink 的处理方式是：
 
-最终从 `0.2.0` 起改为 `.lnk` 快捷方式，原因是：
+- 真实 PDF 始终只保留一份，Zotero 绑定的也是这一份。
+- 其他 collection 对应的文件夹中创建 `.lnk` 快捷方式分身。
+- 普通拖拽到新 collection 时，保留当前真实文件位置，并在新增 collection 文件夹中创建快捷方式。
+- Shift+拖拽到新 collection 时，把真实 PDF 移动到新 collection 对应文件夹，并把原来的 collection 文件夹改为快捷方式分身。
+- 如果条目从某个 collection 中移除，ZotLink 会删除对应的快捷方式分身。
+- 如果真实文件改名或移动，ZotLink 会在同步时刷新这些快捷方式。
+
+这样做的目的，是让同一个 Zotero 条目可以自然出现在多个 collection 文件夹中，同时避免真的复制多份 PDF。
+
+### 为什么没有选择硬链接
+
+ZotLink 曾认真考虑过硬链接模式：同一个文件实体可以出现在多个 collection 文件夹中，且机内码相同。这个方案技术上可行，也能减少真实文件重复。
+
+最终选择 `.lnk` 快捷方式，原因是：
 
 - Zotero 附件条目本身只支持一个绑定文件路径，硬链接会让“哪个路径才是主路径”变得不直观。
 - Everything、同步盘和普通文件管理流程对硬链接的呈现不一定符合用户预期。
 - 删除某个硬链接路径时，用户容易误以为删除了文件本体，或反过来以为残留路径应该自动消失。
 - 不同 collection 下硬链接文件名可以不同，但它们指向同一个文件实体，文件名同步和路径反推会带来额外复杂性。
-- `.lnk` 更明确：真实 PDF 只有一份，其他 collection 文件夹里的是入口和镜像。
+- `.lnk` 更明确：真实 PDF 只有一份，其他 collection 文件夹里的是入口和分身。
 
 硬链接相关代码仍保留在源码中作为 legacy/reference，方便以后研究或开源后供他人参考。
 
@@ -160,15 +175,6 @@ extensions.zotlink.attachmentFileIndex
 - `path`：兼容旧版本的主路径字段，等同于 `primaryPath`。
 - `hardlinkPaths`：旧硬链接模式遗留字段，`0.2.0` 会逐步清理。
 
-## 与 Zotero Literature Fields 的关系
-
-从 Zotero Literature Fields `0.1.55` 开始，字段功能和链接附件功能已经拆分：
-
-- Zotero Literature Fields：负责文献类型、自定义字段和主列表字段列。
-- ZotLink：负责链接附件移动、机内码索引、collection 镜像、附件链接修复、PDF DOI metadata 写回和主 PDF 重命名。
-
-两个插件使用不同的插件 ID 和偏好设置前缀，可以独立安装和维护。
-
 ## 发布说明
 
 GitHub Release 建议包含：
@@ -190,9 +196,9 @@ Zotero 插件市场说明建议突出：
 ## 注意事项
 
 - ZotLink 当前主要面向 Windows，因为机内码、`.lnk` 和 NTFS 移动语义都依赖 Windows。
+- ZotLink 面向链接附件工作流；偏好 Zotero storage 文件附件、并希望文件始终留在 Zotero storage 内的用户，可能不适合使用本插件。
 - `.lnk` 快捷方式不是 Zotero 附件本体；Zotero 仍只绑定真实文件路径。
 - `0.3.0` 的 DOI metadata 写回会修改 PDF 源文件，请在首次全库执行前备份附件目录。
-- 如果你从 `0.1.x` 硬链接版本升级，建议先备份附件目录。`0.2.0+` 会在同步时清理旧硬链接镜像并创建快捷方式。
 - OneDrive 等同步盘可能会短暂显示同步中的临时状态，但 ZotLink 的真实文件迁移仍使用移动操作。
 
 ## 版本记录
