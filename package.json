@@ -1,6 +1,6 @@
 {
   "name": "zotlink",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "author": "Yihtsy <yihtsy@outlook.com>",
   "description": "Zotero plugin for linked attachment moving, shortcut mirrors, and link repair.",

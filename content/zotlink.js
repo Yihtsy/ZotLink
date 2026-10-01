@@ -514,6 +514,9 @@
 						}
 					}
 					await this.writeAttachmentPDFDOIMetadata(attachment, { silent: true });
+					if (await this.isPrimaryPDFAttachment(attachment)) {
+						await this.alignAttachmentPDFPageLabels(attachment, { silent: true });
+					}
 					synced++;
 					if (diagnosticsEnabled) {
 						diagnosticLines.push(this.formatMirrorDiagnosticLine(attachment, syncResult));
@@ -807,17 +810,17 @@
 				}
 
 				if (action === "writeAllPDFDOIMetadata") {
-					let originalLabel = button?.getAttribute?.("label") || "写入全库 PDF DOI 元数据";
+					let originalLabel = button?.getAttribute?.("label") || "写入全库 PDF DOI 元数据并对齐页码";
 					if (button) {
 						button.disabled = true;
-						button.setAttribute("label", "正在写入...");
+						button.setAttribute("label", "正在写入/对齐...");
 					}
 					try {
 						await this.writeAllLibraryPDFDOIMetadata({
 							useProgressWindow: false,
 							softReport: true,
 							onProgress: ({ processed, total }) => {
-								button?.setAttribute?.("label", `正在写入 ${processed}/${total}`);
+								button?.setAttribute?.("label", `正在处理 ${processed}/${total}`);
 							}
 						});
 					}
@@ -1045,6 +1048,11 @@
 			writePDFDOIMetadataItem.setAttribute("label", "写入 PDF DOI 元数据");
 			writePDFDOIMetadataItem.addEventListener("command", () => this.writeSelectedPDFDOIMetadata());
 			popup.appendChild(writePDFDOIMetadataItem);
+
+			let alignPDFPageLabelsItem = doc.createXULElement("menuitem");
+			alignPDFPageLabelsItem.setAttribute("label", "对齐 PDF 页码");
+			alignPDFPageLabelsItem.addEventListener("command", () => this.alignSelectedPDFPageLabels());
+			popup.appendChild(alignPDFPageLabelsItem);
 
 			let renamePrimaryPDFItem = doc.createXULElement("menuitem");
 			renamePrimaryPDFItem.setAttribute("label", "按规则重命名主 PDF");
@@ -1992,6 +2000,65 @@
 			this.showMoveReport(`选中主 PDF DOI 元数据写入完成：共检查 ${attachments.length} 个主 PDF，已写入 ${written} 个${skipped ? `，跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。`);
 		},
 
+		async alignSelectedPDFPageLabels() {
+			let attachments = await this.getSelectedPrimaryPDFAttachments();
+			if (!attachments.length) {
+				this.showMoveReport("未找到可对齐页码的主 PDF 附件");
+				return;
+			}
+
+			let aligned = 0;
+			let skipped = 0;
+			let reasons = new Map();
+			for (let attachment of attachments) {
+				try {
+					let result = await this.alignAttachmentPDFPageLabels(attachment, { silent: true });
+					if (result.ok && result.changed) {
+						aligned++;
+					}
+					else {
+						skipped++;
+						this.countReason(reasons, result.reason || "未知原因");
+					}
+				}
+				catch (e) {
+					Zotero.logError(e);
+					skipped++;
+					this.countReason(reasons, e.message || "异常");
+				}
+			}
+
+			let reasonText = this.formatReasons(reasons);
+			this.showMoveReport(`选中主 PDF 页码对齐完成：共检查 ${attachments.length} 个主 PDF，已对齐 ${aligned} 个${skipped ? `，跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。`);
+		},
+
+		async alignAttachmentPDFPageLabels(attachment, options = {}) {
+			if (!attachment?.isFileAttachment?.()) {
+				return { ok: false, changed: false, reason: "不是文件附件" };
+			}
+			if (attachment.libraryID !== Zotero.Libraries.userLibraryID) {
+				return { ok: false, changed: false, reason: "非个人库附件" };
+			}
+			let path = attachment.getFilePath();
+			if (!path || !(await IOUtils.exists(path))) {
+				return { ok: false, changed: false, reason: "源文件不存在" };
+			}
+			if (!this.isPDFFilePath(path, attachment)) {
+				return { ok: false, changed: false, reason: "不是 PDF" };
+			}
+
+			let pageRange = this.getAttachmentParentPageRange(attachment);
+			if (!pageRange) {
+				return { ok: false, changed: false, reason: "父条目页码不是常规范围" };
+			}
+
+			let result = await this.writePDFPageLabelsWithPikepdf(path, pageRange, this.getAttachmentParentDOI(attachment));
+			if (result.ok && result.changed && !options.silent) {
+				this.showSoftReport(`已对齐 PDF 页码：${PathUtils.filename(path)}`, 3000);
+			}
+			return result;
+		},
+
 		getAttachmentParentDOI(attachment) {
 			let parent = attachment?.parentItem;
 			if (!parent?.isRegularItem?.()) {
@@ -2000,9 +2067,164 @@
 			return this.normalizeDOI(parent.getField?.("DOI"));
 		},
 
+		getAttachmentParentPageRange(attachment) {
+			let parent = attachment?.parentItem;
+			if (!parent?.isRegularItem?.()) {
+				return "";
+			}
+			return this.normalizePageRange(parent.getField?.("pages"));
+		},
+
+		normalizePageRange(value) {
+			let text = String(value || "").trim();
+			if (!text || !/[-–—]/.test(text)) {
+				return "";
+			}
+			let match = text.match(/^\s*([A-Za-z]*)(\d+)\s*[-–—]\s*([A-Za-z]*)(\d+)\s*$/);
+			return match ? text : "";
+		},
+
 		isPDFFilePath(path, attachment = null) {
 			let contentType = String(attachment?.attachmentContentType || "").toLowerCase();
 			return contentType === "application/pdf" || /\.pdf$/i.test(String(path || ""));
+		},
+
+		async writePDFPageLabelsWithPikepdf(pdfPath, pageRange, doi = "") {
+			let outputPath = this.getTempTextPath("zotlink-pdf-page-labels");
+			let scriptPath = this.getTempTextPath("zotlink-pdf-page-labels").replace(/\.txt$/i, ".py");
+			let script = [
+				"import json, os, re, shutil, sys, tempfile, traceback",
+				"path, page_range, doi, output = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]",
+				"PAGE_RANGE_RE = re.compile(r'^\\s*([A-Za-z]*)(\\d+)\\s*[-–—]\\s*([A-Za-z]*)(\\d+)\\s*$')",
+				"def finish(**data):",
+				"    with open(output, 'w', encoding='utf-8') as f:",
+				"        json.dump(data, f, ensure_ascii=False)",
+				"def parse_page_range(value):",
+				"    match = PAGE_RANGE_RE.match(value or '')",
+				"    if not match:",
+				"        return None",
+				"    first_prefix, first_text, last_prefix, last_text = match.groups()",
+				"    first_number = int(first_text)",
+				"    last_number = int(last_text)",
+				"    if last_number < first_number:",
+				"        base = 10 ** len(last_text)",
+				"        last_number = (first_number // base) * base + last_number",
+				"        if last_number < first_number:",
+				"            last_number += base",
+				"    count = last_number - first_number + 1",
+				"    if count <= 0:",
+				"        return None",
+				"    return {'first': first_number, 'last': last_number, 'prefix': first_prefix or last_prefix, 'count': count}",
+				"def simple_dict(start, prefix, st):",
+				"    data = {'/S': '/D', '/P': prefix, '/St': st}",
+				"    return [start, data]",
+				"def normalize_page_labels(root):",
+				"    labels = root.get('/PageLabels', None)",
+				"    if not labels:",
+				"        return []",
+				"    nums = labels.get('/Nums', [])",
+				"    normalized = []",
+				"    for i in range(0, len(nums), 2):",
+				"        try:",
+				"            start = int(nums[i])",
+				"            label = nums[i + 1]",
+				"        except Exception:",
+				"            continue",
+				"        item = {}",
+				"        for key in ['/S', '/P', '/St']:",
+				"            value = label.get(key, None)",
+				"            if value is not None:",
+				"                item[key] = str(value) if key != '/St' else int(value)",
+				"        normalized.append([start, item])",
+				"    return normalized",
+				"try:",
+				"    import pikepdf",
+				"except Exception as e:",
+				"    finish(ok=False, changed=False, reason='缺少 pikepdf', detail=str(e))",
+				"    sys.exit(0)",
+				"try:",
+				"    article = parse_page_range(page_range)",
+				"    if not article:",
+				"        finish(ok=False, changed=False, reason='页码不是常规范围')",
+				"        sys.exit(0)",
+				"    with pikepdf.Pdf.open(path) as pdf:",
+				"        page_count = len(pdf.pages)",
+				"        if page_count < article['count']:",
+				"            finish(ok=False, changed=False, reason='PDF 页数少于条目页码范围', pdfPages=page_count, articlePages=article['count'])",
+				"            sys.exit(0)",
+				"        front_extra = page_count - article['count']",
+				"        planned = []",
+				"        nums = pikepdf.Array()",
+				"        if front_extra:",
+				"            planned.append(simple_dict(0, 'skip-', 1))",
+				"            nums.extend([0, pikepdf.Dictionary({'/S': pikepdf.Name('/D'), '/P': 'skip-', '/St': 1})])",
+				"        planned.append(simple_dict(front_extra, article['prefix'], article['first']))",
+				"        nums.extend([front_extra, pikepdf.Dictionary({'/S': pikepdf.Name('/D'), '/P': article['prefix'], '/St': article['first']})])",
+				"        if normalize_page_labels(pdf.Root) == planned:",
+				"            finish(ok=True, changed=False, reason='页码已对齐', pageRange=page_range, pdfPages=page_count)",
+				"            sys.exit(0)",
+				"        pdf.Root.PageLabels = pikepdf.Dictionary({'/Nums': nums})",
+				"        fd, tmp_name = tempfile.mkstemp(prefix=os.path.splitext(os.path.basename(path))[0] + '.', suffix='.pdf', dir=os.path.dirname(path) or None)",
+				"        os.close(fd)",
+				"        try:",
+				"            pdf.save(tmp_name)",
+				"            shutil.move(tmp_name, path)",
+				"        finally:",
+				"            if os.path.exists(tmp_name):",
+				"                os.unlink(tmp_name)",
+				"    finish(ok=True, changed=True, reason='已对齐页码', pageRange=page_range, pdfPages=page_count, frontExtraPages=front_extra)",
+				"except Exception as e:",
+				"    finish(ok=False, changed=False, reason='页码写入失败', detail=''.join(traceback.format_exception_only(type(e), e)).strip())"
+			].join("\n");
+			try {
+				await IOUtils.write(scriptPath, new TextEncoder().encode(script));
+				let execResult = await this.execDiagnosticCommand("C:\\Windows\\pyw.exe", [
+					"-3",
+					scriptPath,
+					pdfPath,
+					pageRange,
+					doi || "",
+					outputPath
+				]);
+				let text = await this.readCommandOutputFile(outputPath, "");
+				let result = {};
+				try {
+					result = JSON.parse(text || "{}");
+				}
+				catch (e) {
+					result = {
+						ok: false,
+						changed: false,
+						reason: "无法解析页码写入结果",
+						detail: text || execResult.diagnostic
+					};
+				}
+				if (!result.ok) {
+					Zotero.debug(`ZotLink PDF page-label write skipped/failed: ${result.reason || ""} ${result.detail || ""}`, 1);
+				}
+				return result;
+			}
+			catch (e) {
+				Zotero.logError(e);
+				return {
+					ok: false,
+					changed: false,
+					reason: "执行 Python 失败",
+					detail: this.errorToText(e)
+				};
+			}
+			finally {
+				for (let path of [scriptPath, outputPath]) {
+					try {
+						if (await IOUtils.exists(path)) {
+							await IOUtils.remove(path);
+						}
+					}
+					catch (e) {
+						Zotero.logError(e);
+					}
+				}
+			}
 		},
 
 		async writePDFDOIMetadataWithPikepdf(pdfPath, doi) {
@@ -2108,24 +2330,41 @@
 			}
 
 			let written = 0;
+			let pageLabelsAligned = 0;
 			let skipped = 0;
 			let reasons = new Map();
 			let startedAt = Date.now();
 			let useProgressWindow = options.useProgressWindow !== false;
 			let progressWindow = useProgressWindow
-				? this.createProgressWindow("正在写入 PDF DOI 元数据", `已处理 0 / ${attachments.length}`)
+				? this.createProgressWindow("正在写入 PDF DOI 元数据并对齐页码", `已处理 0 / ${attachments.length}`)
 				: null;
 
 			for (let i = 0; i < attachments.length; i++) {
 				let attachment = attachments[i];
 				try {
+					let changedAnything = false;
 					let result = await this.writeAttachmentPDFDOIMetadata(attachment, { silent: true });
 					if (result.ok && result.changed) {
 						written++;
+						changedAnything = true;
 					}
 					else {
+						this.countReason(reasons, `DOI：${result.reason || "未知原因"}`);
+					}
+
+					if (await this.isPrimaryPDFAttachment(attachment)) {
+						let pageResult = await this.alignAttachmentPDFPageLabels(attachment, { silent: true });
+						if (pageResult.ok && pageResult.changed) {
+							pageLabelsAligned++;
+							changedAnything = true;
+						}
+						else {
+							this.countReason(reasons, `页码：${pageResult.reason || "未知原因"}`);
+						}
+					}
+
+					if (!changedAnything) {
 						skipped++;
-						this.countReason(reasons, result.reason || "未知原因");
 					}
 				}
 				catch (e) {
@@ -2140,16 +2379,17 @@
 						processed,
 						total: attachments.length,
 						written,
+						pageLabelsAligned,
 						skipped
 					});
-					this.updateProgressWindow(progressWindow, "正在写入 PDF DOI 元数据", `已处理 ${processed} / ${attachments.length}，已写入 ${written}，跳过 ${skipped}`);
+					this.updateProgressWindow(progressWindow, "正在写入 PDF DOI 元数据并对齐页码", `已处理 ${processed} / ${attachments.length}，DOI ${written}，页码 ${pageLabelsAligned}，跳过 ${skipped}`);
 				}
 			}
 
 			let seconds = Math.round((Date.now() - startedAt) / 1000);
 			let reasonText = this.formatReasons(reasons);
-			let message = `全库 PDF DOI 元数据写入完成：共检查 ${attachments.length} 个 PDF 附件，已写入 ${written} 个${skipped ? `，跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。耗时约 ${seconds} 秒。`;
-			this.updateProgressWindow(progressWindow, "PDF DOI 元数据写入完成", `已写入 ${written}，跳过 ${skipped}，耗时约 ${seconds} 秒`, 6000);
+			let message = `全库 PDF DOI 元数据写入与页码对齐完成：共检查 ${attachments.length} 个 PDF 附件，DOI 已写入 ${written} 个，页码已对齐 ${pageLabelsAligned} 个${skipped ? `，跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。耗时约 ${seconds} 秒。`;
+			this.updateProgressWindow(progressWindow, "PDF DOI 元数据写入与页码对齐完成", `DOI ${written}，页码 ${pageLabelsAligned}，跳过 ${skipped}，耗时约 ${seconds} 秒`, 6000);
 			if (options.softReport) {
 				this.showSoftReport(message, 8000);
 			}

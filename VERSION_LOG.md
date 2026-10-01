@@ -1,6 +1,16 @@
 # ZotLink 版本记录
 
-## 当前版本：0.3.1
+## 当前版本：0.3.2
+
+### 本版变化
+
+- 新增 PDF 页码标签对齐：读取父条目 `pages` 字段，只在值为常规范围（如 `10-18`、`S10-S18`）时使用 `pikepdf` 写入 PDF `/PageLabels`。
+- 新增条目右键菜单 `ZotLink -> 对齐 PDF 页码`，右键普通条目时处理主 PDF，右键具体 PDF 附件时处理该附件。
+- 全库 `写入全库 PDF DOI 元数据并对齐页码` 会在原有 DOI metadata 写回流程中同步尝试对齐主 PDF 页码。
+- 新增/导入/同步主 PDF 时，会在 DOI metadata 写回后静默尝试对齐 PDF 页码。
+- 页码对齐功能参考 `pydf-doi` 的 pikepdf PageLabels 写入思路，但不直接依赖该包。
+
+## 0.3.1
 
 ### 本版变化
 

@@ -4,7 +4,7 @@ ZotLink 是一个面向 Zotero 10 的 Windows 链接附件管理插件，主要�
 
 ZotLink 会把 PDF 文件放在可直接浏览、可独立使用的文件夹体系中，同时为 Zotero 记录稳定的文件身份，减少“Zotero 能看到条目，但附件文件已经找不到”的情况。
 
-当前版本：`0.3.1`
+当前版本：`0.3.2`
 
 作者：Yihtsy <yihtsy@outlook.com>
 
@@ -18,12 +18,13 @@ ZotLink 会把 PDF 文件放在可直接浏览、可独立使用的文件夹体�
 - 支持主文件与快捷方式分身换位：Shift+拖拽条目到其他 collection 时，真实文件会移动到新 collection 对应目录，其他目录刷新为快捷方式。
 - 支持从左侧 collection 对应文件夹批量导入 PDF，并按 PDF metadata DOI 创建 Zotero 条目。
 - 支持把父条目的 DOI 写入 PDF 源文件 metadata：`/doi` 与 `/doiURL`；已有字段不会覆盖，只补写缺失字段。
+- 支持按 Zotero 条目的常规页码范围对齐主 PDF 的页码标签。
 - 支持按规则重命名主 PDF，例如 `{author} {year} {title}`，默认不启用。
 - 支持初始化全库附件机内码。
 
 ## 使用方式
 
-1. 在 Zotero 插件管理器中安装 `zotlink-0.3.1.xpi`。
+1. 在 Zotero 插件管理器中安装 `zotlink-0.3.2.xpi`。
 2. 重启 Zotero。
 3. 在 ZotLink 设置中填写附件移动顶层路径，例如 `D:\OneDrive\Zotero`。
 4. 选中文献条目或附件，使用右键菜单 `ZotLink -> 移动附件到集合目录`。
@@ -101,7 +102,7 @@ ZotLink -> 导入当前文件夹及子文件夹 PDF
 
 如果目标 collection 中已经存在相同 DOI 的条目，ZotLink 会跳过该 PDF。当前版本不会做全文识别；如果 DOI 不在 metadata 或轻量扫描范围内，会跳过。
 
-### PDF DOI 元数据写回
+### PDF DOI 元数据写回与页码对齐
 
 ZotLink 会在附件同步流程中尝试把父条目的 DOI 写入 PDF 源文件 metadata：
 
@@ -111,12 +112,16 @@ ZotLink 会在附件同步流程中尝试把父条目的 DOI 写入 PDF 源文�
 - 跳过条件：父条目没有 DOI、附件不是 PDF、源文件不存在，或 PDF 中已经同时存在 `/doi` 和 `/doiURL`。
 - 若 PDF 中已有 `/doi` 但缺少 `/doiURL`，ZotLink 会只补写 `/doiURL`；反过来也一样。
 
-设置页提供 `写入全库 PDF DOI 元数据` 按钮，可对当前个人库里的 PDF 附件统一执行一次。若当前 Python 环境缺少 `pikepdf`，结果中会显示 `缺少 pikepdf`。
+ZotLink 也会尝试按父条目的 `pages` 字段对齐主 PDF 的页码标签。只有 `10-18`、`S10-S18` 这类带连字符的常规页码范围会被处理；文章号或没有连字符的页码值会跳过。
+
+设置页提供 `写入全库 PDF DOI 元数据并对齐页码` 按钮，可对当前个人库里的 PDF 附件统一执行一次。若当前 Python 环境缺少 `pikepdf`，结果中会显示 `缺少 pikepdf`。
 
 条目右键菜单的 `ZotLink -> 写入 PDF DOI 元数据` 可只对当前选中范围执行：
 
 - 右键普通条目时，只处理该条目的主 PDF。
 - 右键具体 PDF 附件时，只处理该附件。
+
+条目右键菜单的 `ZotLink -> 对齐 PDF 页码` 可单独执行页码对齐。
 
 ### 索引数据
 
