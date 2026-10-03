@@ -14,6 +14,7 @@ const entries = [
 	"LICENSE",
 	"README.md",
 	"FUNCTIONS.md",
+	"ARTICLE_HISTORY_FORMATS.md",
 	"VERSION_LOG.md",
 	"bootstrap.js",
 	"prefs.js",
