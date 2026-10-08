@@ -1,12 +1,16 @@
 pref("extensions.zotlink.attachmentMoveRoot", "D:\\OneDrive\\Zotero");
 pref("extensions.zotlink.attachmentMoveShortcut", "");
-pref("extensions.zotlink.autoRenameAttachmentsEnabled", false);
-pref("extensions.zotlink.attachmentRenamePattern", "{author} {year} {title}");
+pref("extensions.zotlink.copyLinkShortcut", "");
+pref("extensions.zotlink.copyObsidianLinkShortcut", "");
+pref("extensions.zotlink.updateMissingAttachmentFileIDs", true);
+pref("extensions.zotlink.autoRenameNewAttachments", false);
 pref("extensions.zotlink.autoWritePDFDOIMetadata", true);
 pref("extensions.zotlink.autoAlignPDFPageLabels", true);
 pref("extensions.zotlink.autoExtractArticleHistory", false);
 pref("extensions.zotlink.autoSetPDFOpenToFirstPage", true);
 pref("extensions.zotlink.autoSetPDFDisplayTitleFileName", true);
+pref("extensions.zotlink.useAlertForCollectionImportCompletion", false);
 pref("extensions.zotlink.lastMoveReport", "");
 pref("extensions.zotlink.lastIndexReport", "");
 pref("extensions.zotlink.attachmentFileIndex", "{}");
+pref("extensions.zotlink.pendingAttachmentMoves", "{}");

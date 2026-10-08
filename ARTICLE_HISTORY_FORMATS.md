@@ -9,7 +9,7 @@ Accepted: YYYY-MM-DD
 Online: YYYY-MM-DD
 ```
 
-The ZotLink implementation is intentionally conservative: it reads the main PDF of journal article items, extracts text from the first page, last page, and early pages, then updates only the four recognized Extra lines. Other Extra content is preserved.
+The ZotLink implementation is intentionally conservative: it reads the main PDF of journal article items, extracts text from the first four and last four pages, then fills only missing values among the four recognized Extra lines. Existing values and all other Extra content are preserved.
 
 ## Elsevier
 
@@ -47,6 +47,13 @@ Observed or supported labels:
 - `Available online`
 - `Online publication`
 - `Online`
+
+Late-page layouts are also supported, including compact forms such as:
+
+```text
+Received: 23 March 2022 Accepted: 23 November 2022
+published online: 14 December 2022
+```
 
 Supported date forms:
 

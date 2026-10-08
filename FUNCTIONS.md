@@ -1,5 +1,7 @@
 # ZotLink 功能细化
 
+开发中的 Zotero 状态冲突、回收站残留、跨分类重复条目和 UI 刷新问题，统一记录在 `DEVELOPMENT_NOTES.md`。
+
 ## 目标
 
 ZotLink 负责 Zotero 链接附件的移动、机内码记录、collection 镜像和链接修复，不处理文献类型或自定义字段。
@@ -131,6 +133,8 @@ extensions.zotlink.attachmentFileIndex
 
 - `attachmentMoveRoot`：附件移动和修复扫描的顶层路径。
 - `attachmentMoveShortcut`：移动附件快捷键。
+- `copyLinkShortcut`：复制 DOI/URL 链接快捷键。
+- `copyObsidianLinkShortcut`：复制 Obsidian 文献链接快捷键。
 - `lastMoveReport`：最近一次移动或修复结果。
 - `lastIndexReport`：最近一次全库初始化结果。
 - `attachmentFileIndex`：附件机内码索引。

@@ -12,7 +12,8 @@ const outPath = path.join(dist, `${manifest.name.toLowerCase().replace(/[^a-z0-9
 const entries = [
 	"manifest.json",
 	"LICENSE",
-	"README.md",
+  "README.md",
+  "USER_MANUAL.md",
 	"FUNCTIONS.md",
 	"ARTICLE_HISTORY_FORMATS.md",
 	"VERSION_LOG.md",

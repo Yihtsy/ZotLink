@@ -8,9 +8,11 @@
 	const ITEM_MENU_ID = "zotlink-item-menu";
 	const COLLECTION_MENU_ID = "zotlink-collection-menu";
 	const MOVE_SHORTCUT_KEY_ID = "zotlink-move-shortcut-key";
+	const COPY_LINK_SHORTCUT_KEY_ID = "zotlink-copy-link-shortcut-key";
+	const COPY_OBSIDIAN_LINK_SHORTCUT_KEY_ID = "zotlink-copy-obsidian-link-shortcut-key";
 	const PLUGIN_NAME = "ZotLink";
 	const DEFAULT_ATTACHMENT_MOVE_ROOT = "D:\\OneDrive\\Zotero";
-	const DEFAULT_ATTACHMENT_RENAME_PATTERN = "{author} {year} {title}";
+	const MAX_CITATION_PATH_LENGTH = 280;
 	const FTL_FILE = "zotlink.ftl";
 	const ARTICLE_HISTORY_INFO_ROWS = [
 		{ key: "Received", rowID: "zotlink-received-date-row", l10nID: "zotlink-info-row-received-date" },
@@ -33,9 +35,21 @@
 		_pendingAttachmentFileIDDiagnostics: false,
 		_pendingPreferredPrimaryCollectionIDs: new Map(),
 		_pendingRemovedCollectionIDs: new Map(),
+		_pendingCollectionPathChanges: new Map(),
+		_pendingAutomaticPDFOperationItemIDs: new Set(),
+		_citationMetadataByItemID: new Map(),
+		_automaticCitationRenameHandledAttachmentIDs: new Set(),
 		_attachmentFileIDTimer: null,
 		_attachmentFileIDRetryCounts: new Map(),
+		_collectionPathSnapshot: new Map(),
+		_lastCollectionPathChangeSignature: "",
+		_lastCollectionPathChangeAt: 0,
+		_pendingMoveRetryTimer: null,
+		_retryingPendingMoves: false,
+		_pendingEmptyDirectoryCleanupPaths: new Set(),
+		_emptyDirectoryCleanupTimers: new Set(),
 		_collectionDragHandlers: new Map(),
+		_collectionPDFImportRunning: false,
 		_pluginID: PLUGIN_ID,
 		_rootURI: null,
 		_started: false,
@@ -56,10 +70,15 @@
 			}
 			this.runStartupStep("registerArticleHistoryInfoRows", () => this.registerArticleHistoryInfoRows());
 			this.runStartupStep("registerAttachmentFileIDObserver", () => this.registerAttachmentFileIDObserver());
+			this.runStartupStep("schedulePendingAttachmentMoveRetry", () => this.schedulePendingAttachmentMoveRetry(3000));
 			Zotero.debug("ZotLink started");
 		},
 
 		async shutdown() {
+			this.clearPendingAttachmentMoveRetryTimer();
+			this.clearEmptyDirectoryCleanupTimers();
+			this._citationMetadataByItemID.clear();
+			this._automaticCitationRenameHandledAttachmentIDs.clear();
 			this.unregisterArticleHistoryInfoRows();
 			this.unregisterAttachmentFileIDObserver();
 			this.unregisterItemMenu();
@@ -152,10 +171,34 @@
 			}
 
 			let snapshot = null;
+			let collectionPathSnapshot = null;
+			let collectionPathSnapshotPromise = null;
+			let collectionDragCandidate = false;
+			let collectionDragRootID = null;
 			let timer = null;
 			let dragCompleted = false;
-			let captureSnapshot = () => {
+			let captureSnapshot = event => {
 				snapshot = this.getSelectedItemCollectionSnapshot(win);
+				collectionDragCandidate = this.isLikelyCollectionDragEvent(event, win, snapshot);
+				collectionDragRootID = collectionDragCandidate
+					? this.getSelectedCollectionID(win?.ZoteroPane || Zotero.getActiveZoteroPane?.())
+					: null;
+				let capturedCollectionRootID = collectionDragRootID;
+				collectionPathSnapshot = null;
+				collectionPathSnapshotPromise = (collectionDragCandidate
+					? this.captureCollectionDragStartSnapshot(capturedCollectionRootID)
+					: Promise.resolve(new Map()))
+					.then(snapshot => {
+						collectionPathSnapshot = snapshot;
+						return snapshot;
+					})
+					.catch(e => {
+						Zotero.logError(e);
+						collectionPathSnapshot = capturedCollectionRootID
+							? this.buildCollectionPathSnapshotForCollectionIDs([capturedCollectionRootID])
+							: this.buildCollectionPathSnapshot();
+						return collectionPathSnapshot;
+					});
 				dragCompleted = false;
 			};
 			let completeDrag = source => {
@@ -164,22 +207,31 @@
 				}
 				dragCompleted = true;
 				let dragSnapshot = snapshot || this.getSelectedItemCollectionSnapshot(win);
+				let dragCollectionPathSnapshot = collectionPathSnapshot || null;
+				let dragCollectionPathSnapshotPromise = collectionPathSnapshotPromise || null;
+				let shouldCheckCollectionPath = Boolean(collectionDragCandidate);
+				let dragCollectionRootID = collectionDragRootID || null;
 				snapshot = null;
-				if (!dragSnapshot.size) {
-					return;
-				}
+				collectionPathSnapshot = null;
+				collectionPathSnapshotPromise = null;
+				collectionDragCandidate = false;
+				collectionDragRootID = null;
 				if (timer) {
 					win.clearTimeout(timer);
 				}
-				timer = win.setTimeout(() => {
+				timer = win.setTimeout(async () => {
 					timer = null;
-					this.checkCollectionDragSnapshot(dragSnapshot, source).catch(e => Zotero.logError(e));
-				}, 1500);
+					if (shouldCheckCollectionPath) {
+						dragCollectionPathSnapshot = dragCollectionPathSnapshot
+							|| (dragCollectionPathSnapshotPromise ? await dragCollectionPathSnapshotPromise : null);
+						this.checkCollectionPathDragSnapshot(dragCollectionPathSnapshot, source, dragCollectionRootID).catch(e => Zotero.logError(e));
+					}
+					if (dragSnapshot.size) {
+						this.checkCollectionDragSnapshot(dragSnapshot, source).catch(e => Zotero.logError(e));
+					}
+				}, 500);
 			};
 			let onDrop = () => {
-				if (!snapshot) {
-					captureSnapshot();
-				}
 				completeDrag("drop");
 			};
 			let onDragEnd = () => completeDrag("dragend");
@@ -212,6 +264,18 @@
 			doc.removeEventListener("dragend", handlers.onDragEnd, true);
 			handlers.clearTimer();
 			this._collectionDragHandlers.delete(win);
+		},
+
+		isLikelyCollectionDragEvent(event, win, itemSnapshot) {
+			let target = event?.target;
+			let itemCount = itemSnapshot?.size || 0;
+			for (let node = target; node && node !== win?.document; node = node.parentNode) {
+				let text = `${node.id || ""} ${node.className || ""} ${node.getAttribute?.("role") || ""} ${node.getAttribute?.("data-l10n-id") || ""}`;
+				if (/collection/i.test(text) && !/item/i.test(text)) {
+					return true;
+				}
+			}
+			return itemCount === 0;
 		},
 
 		getSelectedItemCollectionSnapshot(win) {
@@ -274,9 +338,74 @@
 			this.showStatus(`ZotLink 已捕捉 collection 变化：${changedItemIDs.length} 个条目`, 1800);
 			this.scheduleAttachmentFileIDIndexing(changedItemIDs, {
 				delay: 0,
+				runAutomaticPDFOperations: false,
 				preferredPrimaryCollectionIDs,
 				removedCollectionIDs
 			});
+		},
+
+		async checkCollectionPathDragSnapshot(previous, source, rootCollectionID = null) {
+			previous = previous instanceof Map ? previous : new Map();
+			let current = await this.buildCollectionPathSnapshotAsync(rootCollectionID);
+			let inferredCurrent = null;
+			if (rootCollectionID) {
+				let inferredPath = await this.getCollectionPathByIDAsync(rootCollectionID);
+				if (inferredPath.length) {
+					let collection = Zotero.Collections.get(Number(rootCollectionID));
+					inferredCurrent = {
+						path: inferredPath,
+						name: collection?.name || inferredPath[inferredPath.length - 1] || "",
+						parentID: this.getCollectionParentIDValue(collection)
+					};
+				}
+			}
+			if (rootCollectionID && inferredCurrent && !current.has(Number(rootCollectionID))) {
+				current.set(Number(rootCollectionID), inferredCurrent);
+			}
+			if (!rootCollectionID) {
+				this._collectionPathSnapshot = current;
+			}
+			let changes = this.getCollectionPathChanges(previous, current);
+			if (!changes.length) {
+				Zotero.debug(`ZotLink: collection path drag ended (${source}), no path changes`);
+				await this.writeCollectionPathDiagnostic({
+					source: `拖拽${source}`,
+					previousSize: previous.size,
+					currentSize: current.size,
+					changes: [],
+					folderStats: null,
+					itemIDs: [],
+					previousSnapshot: previous,
+					currentSnapshot: current,
+					rootCollectionID,
+					inferredCurrent
+				});
+				let currentRecord = current.get(Number(rootCollectionID)) || inferredCurrent;
+				let collectionName = currentRecord?.name || "所选分类";
+				this.showStatus(`“${collectionName}”的位置没有变化，无需移动文件夹。`, 4000);
+				return;
+			}
+			let summary = this.formatCollectionPathChangesForUser(changes);
+			await this.processCollectionPathChanges(changes, `拖拽${source}`, { pathSummary: summary });
+		},
+
+		async captureCollectionDragStartSnapshot(rootCollectionID) {
+			rootCollectionID = Number(rootCollectionID) || 0;
+			let snapshot = await this.buildCollectionPathSnapshotAsync(rootCollectionID);
+			let record = rootCollectionID ? snapshot.get(rootCollectionID) : null;
+			if (rootCollectionID && !record) {
+				let path = await this.getCollectionPathByIDAsync(rootCollectionID);
+				if (path.length) {
+					let collection = Zotero.Collections.get(rootCollectionID);
+					record = {
+						path,
+						name: collection?.name || path[path.length - 1] || "",
+						parentID: this.getCollectionParentIDValue(collection)
+					};
+					snapshot.set(rootCollectionID, record);
+				}
+			}
+			return snapshot;
 		},
 
 		diffCollectionSignatures(before, after) {
@@ -307,7 +436,10 @@
 				try {
 					let item = await Zotero.Items.getAsync(itemID);
 					if (item?.isAttachment?.()) {
-						await this.repairAttachmentLinkByFileID(item, { silent: true });
+						await this.repairAttachmentLinkByFileID(item, {
+							silent: true,
+							notifyOutsideRoot: true
+						});
 					}
 				}
 				catch (e) {
@@ -321,10 +453,24 @@
 				return;
 			}
 
+			this._collectionPathSnapshot = this.buildCollectionPathSnapshot();
+			this.buildCollectionPathSnapshotAsync()
+				.then(snapshot => {
+					if (snapshot?.size) {
+						this._collectionPathSnapshot = snapshot;
+					}
+				})
+				.catch(e => Zotero.logError(e));
 			this._attachmentFileIDObserver = {
 				notify: (event, type, ids, extraData) => {
+					if (type === "collection") {
+						this.handleCollectionStructureChange(event, ids, extraData).catch(e => Zotero.logError(e));
+					}
 					let itemIDs = this.getNotifierItemIDs(event, type, ids, extraData);
-					this.scheduleAttachmentFileIDIndexing(itemIDs);
+					this.scheduleAttachmentFileIDIndexing(itemIDs, {
+						delay: type === "collection-item" ? 750 : undefined,
+						runAutomaticPDFOperations: type === "item" && event === "add"
+					});
 				}
 			};
 			this._attachmentFileIDNotifierID = Zotero.Notifier.registerObserver(
@@ -332,6 +478,705 @@
 				["item", "collection", "collection-item"],
 				this._pluginID + "-attachment-file-id"
 			);
+		},
+
+		buildCollectionPathSnapshot() {
+			let snapshot = new Map();
+			let collections = Zotero.Collections.getByLibrary
+				? Zotero.Collections.getByLibrary(Zotero.Libraries.userLibraryID)
+				: [];
+			for (let collection of collections || []) {
+				if (!collection?.id) {
+					continue;
+				}
+				let path = this.getCollectionPathByID(collection.id);
+				if (path.length) {
+					snapshot.set(Number(collection.id), {
+						path,
+						name: collection.name || "",
+						parentID: this.getCollectionParentIDValue(collection)
+					});
+				}
+			}
+			return snapshot;
+		},
+
+		async buildCollectionPathSnapshotAsync(rootCollectionID = null) {
+			try {
+				let rows = await Zotero.DB.queryAsync(
+					"SELECT C.collectionID AS collectionID, C.collectionName AS collectionName, C.parentCollectionID AS parentCollectionID FROM collections C LEFT JOIN deletedCollections DC ON C.collectionID=DC.collectionID WHERE C.libraryID=? AND DC.collectionID IS NULL",
+					[Zotero.Libraries.userLibraryID]
+				);
+				let byID = this.buildCollectionRecordMap(rows);
+
+				let snapshot = new Map();
+				for (let record of byID.values()) {
+					if (rootCollectionID && !this.collectionRecordIsInSubtree(record.id, rootCollectionID, byID)) {
+						continue;
+					}
+					let path = this.getCollectionPathFromRecordMap(record.id, byID);
+					if (path.length) {
+						snapshot.set(Number(record.id), {
+							path,
+							name: record.name || path[path.length - 1] || "",
+							parentID: record.parentID || null
+						});
+					}
+				}
+				return snapshot;
+			}
+			catch (e) {
+				Zotero.logError(e);
+				return this.buildCollectionPathSnapshot();
+			}
+		},
+
+		buildCollectionRecordMap(rows) {
+			let byID = new Map();
+			for (let row of rows || []) {
+				let id = Number(row.collectionID || row.collectionid || row[0]);
+				if (!id) {
+					continue;
+				}
+				let parentID = Number(row.parentCollectionID || row.parentcollectionid || row.parentCollectionId || row[2] || 0);
+				byID.set(id, {
+					id,
+					name: row.collectionName || row.collectionname || row[1] || "",
+					parentID: Number.isInteger(parentID) && parentID > 0 ? parentID : null
+				});
+			}
+			return byID;
+		},
+
+		collectionRecordIsInSubtree(collectionID, rootCollectionID, byID) {
+			collectionID = Number(collectionID) || 0;
+			rootCollectionID = Number(rootCollectionID) || 0;
+			if (!collectionID || !rootCollectionID) {
+				return false;
+			}
+			let current = byID?.get?.(collectionID);
+			let guard = new Set();
+			while (current?.id && !guard.has(Number(current.id))) {
+				if (Number(current.id) === rootCollectionID) {
+					return true;
+				}
+				guard.add(Number(current.id));
+				let parentID = current.parentID ? Number(current.parentID) : null;
+				current = parentID ? byID.get(parentID) : null;
+			}
+			return false;
+		},
+
+		buildCollectionPathSnapshotForCollectionIDs(collectionIDs) {
+			let ids = new Set((collectionIDs || [])
+				.map(id => Number(id))
+				.filter(id => Number.isInteger(id) && id > 0));
+			let snapshot = new Map();
+			for (let id of ids) {
+				let path = this.getCollectionPathByID(id);
+				if (path.length) {
+					let collection = Zotero.Collections.get(id);
+					snapshot.set(id, {
+						path,
+						name: collection?.name || path[path.length - 1] || "",
+						parentID: this.getCollectionParentIDValue(collection)
+					});
+				}
+			}
+			return snapshot;
+		},
+
+		getCollectionPathFromRecordMap(collectionID, byID) {
+			let names = [];
+			let current = byID?.get?.(Number(collectionID));
+			let guard = new Set();
+			while (current?.id && !guard.has(Number(current.id))) {
+				guard.add(Number(current.id));
+				if (current.name) {
+					names.unshift(this.sanitizePathSegment(current.name));
+				}
+				let parentID = current.parentID ? Number(current.parentID) : null;
+				current = parentID ? byID.get(parentID) : null;
+			}
+			return names.filter(Boolean);
+		},
+
+		async handleCollectionStructureChange(event) {
+			if (!["add", "modify", "delete"].includes(event)) {
+				return;
+			}
+
+			let previous = this._collectionPathSnapshot || new Map();
+			let current = await this.buildCollectionPathSnapshotAsync();
+			this._collectionPathSnapshot = current;
+			if (event !== "modify" || !previous.size) {
+				return;
+			}
+
+			let changes = this.getCollectionPathChanges(previous, current);
+			if (!changes.length) {
+				return;
+			}
+			await this.processCollectionPathChanges(changes, "notifier", {
+				pathSummary: this.formatCollectionPathChangesForUser(changes)
+			});
+		},
+
+		getCollectionPathChanges(previous, current) {
+			let changes = [];
+			for (let [collectionID, currentRecord] of current) {
+				let previousRecord = previous.get(collectionID);
+				let oldPath = Array.isArray(previousRecord) ? previousRecord : previousRecord?.path;
+				let newPath = Array.isArray(currentRecord) ? currentRecord : currentRecord?.path;
+				if (!oldPath?.length || JSON.stringify(oldPath) === JSON.stringify(newPath)) {
+					continue;
+				}
+				let oldParentID = Array.isArray(previousRecord) ? null : (previousRecord?.parentID ?? null);
+				let newParentID = Array.isArray(currentRecord) ? null : (currentRecord?.parentID ?? null);
+				let oldName = Array.isArray(previousRecord) ? oldPath[oldPath.length - 1] : (previousRecord?.name || oldPath[oldPath.length - 1] || "");
+				let newName = Array.isArray(currentRecord) ? newPath[newPath.length - 1] : (currentRecord?.name || newPath[newPath.length - 1] || "");
+				changes.push({
+					collectionID,
+					oldPath,
+					newPath,
+					oldParentID,
+					newParentID,
+					oldName,
+					newName,
+					parentChanged: oldParentID !== null && newParentID !== null && Number(oldParentID) !== Number(newParentID),
+					nameChanged: oldName !== newName
+				});
+			}
+			return changes;
+		},
+
+		async processCollectionPathChanges(changes, source = "", options = {}) {
+			if (!Array.isArray(changes) || !changes.length) {
+				return;
+			}
+			let pathSummary = String(options.pathSummary || "").trim();
+			let signature = this.getCollectionPathChangeSignature(changes);
+			let now = Date.now();
+			if (signature && signature === this._lastCollectionPathChangeSignature && now - this._lastCollectionPathChangeAt < 3000) {
+				Zotero.debug(`ZotLink: skipped duplicate collection path changes from ${source || "unknown"}`);
+				return;
+			}
+			this._lastCollectionPathChangeSignature = signature;
+			this._lastCollectionPathChangeAt = now;
+			let root = this.getAttachmentMoveRoot();
+			let folderStats = null;
+			if (root) {
+				folderStats = await this.moveCollectionFoldersForPathChanges(root, changes);
+			}
+
+			let itemIDs = await this.getItemIDsForCollectionIDs(changes.map(change => change.collectionID));
+			await this.writeCollectionPathDiagnostic({
+				source,
+				previousSize: null,
+				currentSize: null,
+				changes,
+				folderStats,
+				itemIDs
+			});
+			let folderText = this.formatCollectionFolderResultForUser(folderStats);
+			let pathText = pathSummary ? `；${pathSummary}` : "";
+			if (!itemIDs.length) {
+				this.showStatus(`分类文件夹同步完成${pathText}${folderText}；该分类下没有需要更新链接的 Zotero 条目。`, 10000);
+				return;
+			}
+			this.showStatus(`分类文件夹同步完成${pathText}${folderText}；正在更新 ${itemIDs.length} 个条目的附件链接。`, 10000);
+			this.scheduleAttachmentFileIDIndexing(itemIDs, {
+				delay: 250,
+				runAutomaticPDFOperations: false,
+				collectionPathChanges: changes
+			});
+		},
+
+		formatCollectionPathChangesForUser(changes) {
+			let change = Array.isArray(changes) ? changes[0] : null;
+			if (!change) {
+				return "";
+			}
+			let root = this.getAttachmentMoveRoot();
+			let oldFolder = root && change.oldPath?.length ? PathUtils.join(root, ...change.oldPath) : "";
+			let newFolder = root && change.newPath?.length ? PathUtils.join(root, ...change.newPath) : "";
+			let name = change.newName || change.oldName || "分类";
+			let prefix = changes.length > 1 ? `“${name}”等 ${changes.length} 个分类` : `“${name}”`;
+			if (oldFolder && newFolder) {
+				return `${prefix}：${oldFolder} → ${newFolder}`;
+			}
+			return `${prefix}的位置已更新`;
+		},
+
+		formatCollectionFolderResultForUser(stats) {
+			if (!stats) {
+				return "";
+			}
+			let parts = [];
+			if (stats.moved) {
+				parts.push(stats.moved === 1 ? "文件夹已移动" : `已移动 ${stats.moved} 个文件夹`);
+			}
+			if (stats.merged) {
+				parts.push(stats.merged === 1 ? "内容已合并到目标文件夹" : `已合并 ${stats.merged} 个文件夹`);
+				if (stats.cleanupPending) {
+					parts.push("源文件夹将在确认为空后后台清理");
+				}
+				else if (stats.removedSourceDirs) {
+					parts.push("源空文件夹已删除");
+				}
+			}
+			if (stats.skipped) {
+				parts.push(`跳过 ${stats.skipped} 个无需处理的路径`);
+			}
+			return parts.length ? `；${parts.join("，")}` : "";
+		},
+
+		formatCollectionPathSnapshotSummary(previous, current, rootCollectionID, inferredCurrent = null, options = {}) {
+			rootCollectionID = Number(rootCollectionID) || 0;
+			let id = rootCollectionID || Number(previous?.keys?.().next?.().value) || 0;
+			let before = id ? previous?.get?.(id) : null;
+			let after = id ? current?.get?.(id) : null;
+			let oldPath = (before?.path || []).join("/");
+			let newPath = (after?.path || []).join("/");
+			let root = this.getAttachmentMoveRoot();
+			let oldFolder = root && before?.path?.length ? PathUtils.join(root, ...before.path) : "";
+			let newFolder = root && after?.path?.length ? PathUtils.join(root, ...after.path) : "";
+			let parts = options.includeRoot === false
+				? []
+				: [`rootCollectionID=${id || rootCollectionID || "unknown"}`];
+			if (before && after) {
+				parts.push(
+					oldPath ? `旧路径=${oldPath}` : "",
+					newPath ? `新路径=${newPath}` : "",
+					oldFolder ? `旧文件夹=${oldFolder}` : "",
+					newFolder ? `新文件夹=${newFolder}` : ""
+				);
+				return parts.filter(Boolean).join("；");
+			}
+
+			if (before) {
+				parts.push(oldPath ? `拖拽前路径=${oldPath}` : "", oldFolder ? `拖拽前文件夹=${oldFolder}` : "");
+			}
+			let currentRecord = after || inferredCurrent;
+			let currentPath = (currentRecord?.path || []).join("/");
+			let currentFolder = root && currentRecord?.path?.length ? PathUtils.join(root, ...currentRecord.path) : "";
+			let label = after ? "当前路径" : "当前推测路径";
+			parts.push(
+				currentPath ? `${label}=${currentPath}` : "当前推测路径=无法解析",
+				currentFolder ? `${label.replace("路径", "文件夹")}=${currentFolder}` : ""
+			);
+			return parts.filter(Boolean).join("；");
+		},
+
+		async writeCollectionPathDiagnostic({ source, previousSize, currentSize, changes, folderStats, itemIDs, previousSnapshot = null, currentSnapshot = null, rootCollectionID = null, inferredCurrent = null }) {
+			let lines = [
+				"ZotLink 分类路径变化诊断",
+				`时间：${new Date().toISOString()}`,
+				`来源：${source || "(unknown)"}`,
+				rootCollectionID ? `rootCollectionID：${rootCollectionID}` : "",
+				previousSize === null || previousSize === undefined ? "" : `拖拽前快照 collection 数：${previousSize}`,
+				currentSize === null || currentSize === undefined ? "" : `拖拽后快照 collection 数：${currentSize}`,
+				previousSnapshot && currentSnapshot ? `拖拽根路径：${this.formatCollectionPathSnapshotSummary(previousSnapshot, currentSnapshot, rootCollectionID, inferredCurrent, { includeRoot: false })}` : "",
+				`路径变化数：${changes?.length || 0}`,
+				folderStats ? `文件夹移动统计：移动 ${folderStats.moved || 0}；合并 ${folderStats.merged || 0}；跳过 ${folderStats.skipped || 0}；源目录已删除 ${folderStats.removedSourceDirs || 0}；后台清理 ${folderStats.cleanupPending || 0}` : "文件夹移动统计：未执行",
+				`下属 Zotero 条目数：${itemIDs?.length || 0}`,
+				""
+			].filter(Boolean);
+			for (let change of changes || []) {
+				lines.push([
+					`collectionID=${change.collectionID}`,
+					`name=${change.oldName || change.newName || ""}`,
+					`parent=${change.oldParentID ?? "(none)"} -> ${change.newParentID ?? "(none)"}`,
+					`parentChanged=${change.parentChanged ? "yes" : "no"}`,
+					`nameChanged=${change.nameChanged ? "yes" : "no"}`,
+					`old=${(change.oldPath || []).join("/")}`,
+					`new=${(change.newPath || []).join("/")}`,
+					`oldFolder=${this.getAttachmentMoveRoot() && change.oldPath?.length ? PathUtils.join(this.getAttachmentMoveRoot(), ...change.oldPath) : ""}`,
+					`newFolder=${this.getAttachmentMoveRoot() && change.newPath?.length ? PathUtils.join(this.getAttachmentMoveRoot(), ...change.newPath) : ""}`
+				].join("；"));
+			}
+			try {
+				return await this.writeTextReport("zotlink-collection-path-diagnostic", lines.join("\n"));
+			}
+			catch (e) {
+				Zotero.logError(e);
+				return "(诊断写入失败)";
+			}
+		},
+
+		getCollectionPathChangeSignature(changes) {
+			return (changes || [])
+				.map(change => `${Number(change.collectionID) || 0}:${change.oldParentID ?? ""}>${change.newParentID ?? ""}:${(change.oldPath || []).join("/")}>${(change.newPath || []).join("/")}`)
+				.sort()
+				.join("|");
+		},
+
+		async getItemIDsForCollectionIDs(collectionIDs) {
+			let ids = Array.from(new Set((collectionIDs || [])
+				.map(id => Number(id))
+				.filter(id => Number.isInteger(id) && id > 0)));
+			let itemIDs = new Set();
+			for (let offset = 0; offset < ids.length; offset += 400) {
+				let batch = ids.slice(offset, offset + 400);
+				let placeholders = batch.map(() => "?").join(",");
+				let rows = await Zotero.DB.queryAsync(
+					`SELECT DISTINCT itemID FROM collectionItems WHERE collectionID IN (${placeholders})`,
+					batch
+				);
+				for (let row of rows || []) {
+					let itemID = Number(row?.itemID ?? row);
+					if (Number.isInteger(itemID) && itemID > 0) {
+						itemIDs.add(itemID);
+					}
+				}
+			}
+			return Array.from(itemIDs);
+		},
+
+		async moveCollectionFoldersForPathChanges(root, changes) {
+			if (!root || !Array.isArray(changes) || !changes.length) {
+				return { moved: 0, merged: 0, skipped: 0, removedSourceDirs: 0, cleanupPending: 0 };
+			}
+			let movedOldRoots = [];
+			let stats = { moved: 0, merged: 0, skipped: 0, removedSourceDirs: 0, cleanupPending: 0 };
+			let candidates = changes
+				.map(change => ({
+					...change,
+					oldPath: Array.isArray(change.oldPath) ? change.oldPath.filter(Boolean) : [],
+					newPath: Array.isArray(change.newPath) ? change.newPath.filter(Boolean) : []
+				}))
+				.filter(change => change.oldPath.length && change.newPath.length)
+				.sort((a, b) => a.oldPath.length - b.oldPath.length);
+
+			for (let change of candidates) {
+				if (movedOldRoots.some(oldRoot => this.pathSegmentsStartWith(change.oldPath, oldRoot))) {
+					stats.skipped++;
+					continue;
+				}
+				let oldDir = PathUtils.join(root, ...change.oldPath);
+				let newDir = PathUtils.join(root, ...change.newPath);
+				if (this.pathsEqual(oldDir, newDir)) {
+					stats.skipped++;
+					continue;
+				}
+				try {
+					if (!(await IOUtils.exists(oldDir))) {
+						await IOUtils.makeDirectory(newDir, { createAncestors: true });
+						stats.skipped++;
+						continue;
+					}
+					await IOUtils.makeDirectory(this.getParentPath(newDir), { createAncestors: true });
+					if (await IOUtils.exists(newDir)) {
+						let mergeResult = await this.mergeDirectoryContents(oldDir, newDir);
+						stats.merged++;
+						if (mergeResult.removed) {
+							stats.removedSourceDirs++;
+						}
+						else {
+							stats.cleanupPending++;
+						}
+					}
+					else {
+						await IOUtils.move(oldDir, newDir);
+						stats.moved++;
+					}
+					movedOldRoots.push(change.oldPath);
+				}
+				catch (e) {
+					Zotero.logError(e);
+					try {
+						await IOUtils.makeDirectory(newDir, { createAncestors: true });
+					}
+					catch (inner) {
+						Zotero.logError(inner);
+					}
+					stats.skipped++;
+				}
+			}
+			return stats;
+		},
+
+		pathSegmentsStartWith(pathSegments, prefixSegments) {
+			if (!Array.isArray(pathSegments) || !Array.isArray(prefixSegments) || prefixSegments.length > pathSegments.length) {
+				return false;
+			}
+			return prefixSegments.every((segment, index) => String(pathSegments[index] || "").toLowerCase() === String(segment || "").toLowerCase());
+		},
+
+		async mergeDirectoryContents(sourceDir, targetDir) {
+			let sourceLocator = await this.getWindowsFileIDQuiet(sourceDir);
+			await IOUtils.makeDirectory(targetDir, { createAncestors: true });
+			let children = await IOUtils.getChildren(sourceDir);
+			for (let child of children || []) {
+				let name = PathUtils.filename(child);
+				let destination = PathUtils.join(targetDir, name);
+				if (await IOUtils.exists(destination)) {
+					let isSourceDir = await this.isDirectoryPath(child);
+					let isDestinationDir = await this.isDirectoryPath(destination);
+					if (isSourceDir && isDestinationDir) {
+						await this.mergeDirectoryContents(child, destination);
+					}
+					else {
+						let uniqueDestination = await this.getUniqueDestinationPath(destination);
+						if (uniqueDestination) {
+							await IOUtils.move(child, uniqueDestination);
+						}
+					}
+				}
+				else {
+					await IOUtils.move(child, destination);
+				}
+			}
+			if (sourceLocator.fileID) {
+				this.scheduleEmptyDirectoryCleanup(sourceDir, sourceLocator.fileID);
+				return {
+					empty: false,
+					removed: false,
+					childCount: null,
+					reason: "等待后台按文件夹机内码安全清理"
+				};
+			}
+			return {
+				empty: false,
+				removed: false,
+				childCount: null,
+				reason: "无法读取源文件夹机内码，已放弃延迟删除"
+			};
+		},
+
+		async removeDirectoryIfEmpty(directoryPath, expectedFileID = "") {
+			try {
+				if (!(await IOUtils.exists(directoryPath))) {
+					return { empty: true, removed: true, childCount: 0, reason: "目录已不存在" };
+				}
+				if (expectedFileID) {
+					let currentLocator = await this.getWindowsFileIDQuiet(directoryPath);
+					if (!currentLocator.fileID) {
+						return { empty: false, removed: false, childCount: null, identityUnverified: true, reason: "无法验证当前文件夹机内码" };
+					}
+					if (!this.fileIDsEqual(currentLocator.fileID, expectedFileID)) {
+						return { empty: false, removed: false, childCount: null, identityChanged: true, currentFileID: currentLocator.fileID, reason: "路径已指向后来创建的其他文件夹" };
+					}
+				}
+				let children = await IOUtils.getChildren(directoryPath);
+				if (children.length) {
+					return { empty: false, removed: false, childCount: children.length, reason: "目录非空" };
+				}
+				try {
+					await IOUtils.remove(directoryPath);
+					let removed = !(await IOUtils.exists(directoryPath));
+					if (removed) {
+						return { empty: true, removed: true, childCount: 0, reason: "空目录已删除" };
+					}
+				}
+				catch (e) {
+					Zotero.logError(e);
+				}
+				if (expectedFileID) {
+					return await this.removeEmptyDirectoryWithPython(directoryPath, expectedFileID);
+				}
+				return { empty: true, removed: false, childCount: 0, reason: "IOUtils 删除失败且没有可验证的文件夹机内码" };
+			}
+			catch (e) {
+				Zotero.logError(e);
+				return { empty: false, removed: false, childCount: null, reason: this.errorToText(e) || "检查或删除失败" };
+			}
+		},
+
+		async removeEmptyDirectoryWithPython(directoryPath, expectedFileID) {
+			let scriptPath = this.getTempTextPath("zotlink-empty-directory-remove").replace(/\.txt$/i, ".py");
+			let outputPath = this.getTempTextPath("zotlink-empty-directory-remove");
+			let script = [
+				"import ctypes, os, sys, traceback",
+				"path, expected, output_path = sys.argv[1], sys.argv[2].lower(), sys.argv[3]",
+				"kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)",
+				"FILE_SHARE_READ = 0x00000001",
+				"FILE_SHARE_WRITE = 0x00000002",
+				"FILE_SHARE_DELETE = 0x00000004",
+				"OPEN_EXISTING = 3",
+				"FILE_FLAG_BACKUP_SEMANTICS = 0x02000000",
+				"FILE_ATTRIBUTE_READONLY = 0x00000001",
+				"INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF",
+				"INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value",
+				"class FILETIME(ctypes.Structure):",
+				"    _fields_ = [('dwLowDateTime', ctypes.c_uint32), ('dwHighDateTime', ctypes.c_uint32)]",
+				"class INFO(ctypes.Structure):",
+				"    _fields_ = [('attrs', ctypes.c_uint32), ('ctime', FILETIME), ('atime', FILETIME), ('mtime', FILETIME), ('volume', ctypes.c_uint32), ('sizeHigh', ctypes.c_uint32), ('sizeLow', ctypes.c_uint32), ('links', ctypes.c_uint32), ('indexHigh', ctypes.c_uint32), ('indexLow', ctypes.c_uint32)]",
+				"kernel32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]",
+				"kernel32.CreateFileW.restype = ctypes.c_void_p",
+				"kernel32.GetFileInformationByHandle.argtypes = [ctypes.c_void_p, ctypes.POINTER(INFO)]",
+				"kernel32.GetFileInformationByHandle.restype = ctypes.c_int",
+				"kernel32.CloseHandle.argtypes = [ctypes.c_void_p]",
+				"kernel32.CloseHandle.restype = ctypes.c_int",
+				"kernel32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]",
+				"kernel32.GetFileAttributesW.restype = ctypes.c_uint32",
+				"kernel32.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]",
+				"kernel32.SetFileAttributesW.restype = ctypes.c_int",
+				"def file_id(p):",
+				"    handle = kernel32.CreateFileW(p, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, None, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, None)",
+				"    if handle == INVALID_HANDLE_VALUE: raise ctypes.WinError(ctypes.get_last_error())",
+				"    try:",
+				"        info = INFO()",
+				"        if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)): raise ctypes.WinError(ctypes.get_last_error())",
+				"        return ('0x%08x:0x%016x' % (info.volume, (info.indexHigh << 32) | info.indexLow)).lower()",
+				"    finally: kernel32.CloseHandle(handle)",
+				"status = ''",
+				"try:",
+				"    if not os.path.isdir(path): status = 'ABSENT'",
+				"    else:",
+				"        current = file_id(path)",
+				"        if current != expected: status = 'IDENTITY_CHANGED\\t' + current",
+				"        else:",
+				"            with os.scandir(path) as entries: nonempty = next(entries, None) is not None",
+				"            if nonempty: status = 'NONEMPTY'",
+				"            else:",
+				"                current = file_id(path)",
+				"                if current != expected: status = 'IDENTITY_CHANGED\t' + current",
+				"                else:",
+				"                    attrs = kernel32.GetFileAttributesW(path)",
+				"                    if attrs == INVALID_FILE_ATTRIBUTES: raise ctypes.WinError(ctypes.get_last_error())",
+				"                    if attrs & FILE_ATTRIBUTE_READONLY:",
+				"                        if not kernel32.SetFileAttributesW(path, attrs & ~FILE_ATTRIBUTE_READONLY): raise ctypes.WinError(ctypes.get_last_error())",
+				"                    os.rmdir(path)",
+				"                    status = 'REMOVED' if not os.path.exists(path) else 'STILL_EXISTS'",
+				"except Exception as e: status = 'ERROR\\t' + ''.join(traceback.format_exception_only(type(e), e)).strip()",
+				"with open(output_path, 'w', encoding='utf-8') as f: f.write(status)"
+			].join("\n");
+			try {
+				await IOUtils.write(scriptPath, new TextEncoder().encode(script));
+				let result = await this.execDiagnosticCommand("C:\\Windows\\pyw.exe", ["-3", scriptPath, directoryPath, expectedFileID, outputPath], outputPath);
+				let text = String(result.text || "").trim();
+				if (/^(REMOVED|ABSENT)$/i.test(text)) {
+					return { empty: true, removed: true, childCount: 0, reason: `Python：${text}` };
+				}
+				if (/^IDENTITY_CHANGED/i.test(text)) {
+					return { empty: false, removed: false, childCount: null, identityChanged: true, reason: `Python：${text}` };
+				}
+				if (/^NONEMPTY/i.test(text)) {
+					return { empty: false, removed: false, childCount: null, reason: "Python：目录非空" };
+				}
+				return { empty: true, removed: false, childCount: 0, reason: `Python 删除失败：${text || result.diagnostic}` };
+			}
+			catch (e) {
+				Zotero.logError(e);
+				return { empty: true, removed: false, childCount: 0, reason: this.errorToText(e) || "Python 删除失败" };
+			}
+			finally {
+				for (let path of [scriptPath, outputPath]) {
+					try {
+						if (await IOUtils.exists(path)) {
+							await IOUtils.remove(path);
+						}
+					}
+					catch (e) {
+						Zotero.logError(e);
+					}
+				}
+			}
+		},
+
+		async isActiveCollectionFolder(directoryPath) {
+			let root = this.getAttachmentMoveRoot();
+			if (!root || !directoryPath) {
+				return false;
+			}
+			let target = this.normalizePathForCompare(directoryPath);
+			let snapshot = await this.buildCollectionPathSnapshotAsync();
+			for (let record of snapshot.values()) {
+				if (record?.path?.length
+					&& this.normalizePathForCompare(PathUtils.join(root, ...record.path)) === target) {
+					return true;
+				}
+			}
+			return false;
+		},
+
+		scheduleEmptyDirectoryCleanup(directoryPath, expectedFileID) {
+			expectedFileID = this.normalizeFileIDForCompare(expectedFileID);
+			let key = `${this.normalizePathForCompare(directoryPath)}|${expectedFileID}`;
+			if (!directoryPath || !expectedFileID || this._pendingEmptyDirectoryCleanupPaths.has(key)) {
+				return;
+			}
+			this._pendingEmptyDirectoryCleanupPaths.add(key);
+			let delays = [500, 1000, 2000, 4000, 8000, 15000, 30000];
+			let attemptIndex = 0;
+			let diagnosticPath = this.getTempTextPath("zotlink-empty-directory-cleanup");
+			let diagnosticLines = [
+				"ZotLink 空目录后台清理诊断",
+				`开始时间：${new Date().toISOString()}`,
+				`目录：${directoryPath}`,
+				`源文件夹机内码：${expectedFileID}`
+			];
+			let writeDiagnostic = async () => {
+				try {
+					await IOUtils.write(diagnosticPath, new TextEncoder().encode(diagnosticLines.join("\n")));
+				}
+				catch (e) {
+					Zotero.logError(e);
+				}
+			};
+			let finish = async reason => {
+				this._pendingEmptyDirectoryCleanupPaths.delete(key);
+				diagnosticLines.push(`结束时间：${new Date().toISOString()}`, `结果：${reason}`);
+				await writeDiagnostic();
+			};
+			writeDiagnostic().catch(e => Zotero.logError(e));
+			let scheduleNext = () => {
+				if (attemptIndex >= delays.length) {
+					finish("达到有限重试上限，保留目录").catch(e => Zotero.logError(e));
+					return;
+				}
+				let delay = delays[attemptIndex++];
+				let timer = setTimeout(async () => {
+					this._emptyDirectoryCleanupTimers.delete(timer);
+					let attemptNumber = attemptIndex;
+					if (!(await IOUtils.exists(directoryPath))) {
+						diagnosticLines.push(`尝试 ${attemptNumber}：原目录已不存在`);
+						await finish("原目录已不存在");
+						return;
+					}
+					let currentLocator = await this.getWindowsFileIDQuiet(directoryPath);
+					if (!currentLocator.fileID) {
+						diagnosticLines.push(`尝试 ${attemptNumber}：无法验证当前文件夹机内码，暂不删除`);
+						await writeDiagnostic();
+						scheduleNext();
+						return;
+					}
+					if (!this.fileIDsEqual(currentLocator.fileID, expectedFileID)) {
+						diagnosticLines.push(`尝试 ${attemptNumber}：文件夹机内码已变化；当前=${currentLocator.fileID}；旧任务作废`);
+						await finish("路径已被后来创建的其他文件夹复用，未删除");
+						return;
+					}
+					if (await this.isActiveCollectionFolder(directoryPath)) {
+						diagnosticLines.push(`尝试 ${attemptNumber}：当前仍对应有效分类路径，暂不删除并继续等待`);
+						await writeDiagnostic();
+						scheduleNext();
+						return;
+					}
+					let result = await this.removeDirectoryIfEmpty(directoryPath, expectedFileID);
+					diagnosticLines.push(`尝试 ${attemptNumber}：empty=${result.empty ? "yes" : "no"}；removed=${result.removed ? "yes" : "no"}；children=${result.childCount ?? "unknown"}；${result.reason || ""}`);
+					await writeDiagnostic();
+					if (result.identityChanged) {
+						await finish("文件夹身份已变化，未删除");
+						return;
+					}
+					if (result.removed) {
+						await finish("目录已安全删除");
+						return;
+					}
+					scheduleNext();
+				}, delay);
+				this._emptyDirectoryCleanupTimers.add(timer);
+			};
+			scheduleNext();
+		},
+
+		clearEmptyDirectoryCleanupTimers() {
+			for (let timer of this._emptyDirectoryCleanupTimers) {
+				clearTimeout(timer);
+			}
+			this._emptyDirectoryCleanupTimers.clear();
+			this._pendingEmptyDirectoryCleanupPaths.clear();
 		},
 
 		getNotifierItemIDs(event, type, ids, extraData) {
@@ -405,7 +1250,10 @@
 			this._pendingAttachmentFileIDDiagnostics = false;
 			this._pendingPreferredPrimaryCollectionIDs.clear();
 			this._pendingRemovedCollectionIDs.clear();
+			this._pendingCollectionPathChanges.clear();
+			this._pendingAutomaticPDFOperationItemIDs.clear();
 			this._attachmentFileIDRetryCounts.clear();
+			this._collectionPathSnapshot.clear();
 			if (this._attachmentFileIDNotifierID && Zotero.Notifier) {
 				Zotero.Notifier.unregisterObserver(this._attachmentFileIDNotifierID);
 			}
@@ -436,10 +1284,39 @@
 					this._pendingRemovedCollectionIDs.set(itemID, ids);
 				}
 			}
+			for (let change of options.collectionPathChanges || []) {
+				let collectionID = Number(change?.collectionID);
+				let oldPath = Array.isArray(change?.oldPath) ? change.oldPath.filter(Boolean) : [];
+				let newPath = Array.isArray(change?.newPath) ? change.newPath.filter(Boolean) : [];
+				if (!Number.isInteger(collectionID) || collectionID <= 0 || !oldPath.length) {
+					continue;
+				}
+				let pending = this._pendingCollectionPathChanges.get(collectionID);
+				let firstOldPath = pending?.oldPath?.length ? pending.oldPath : oldPath;
+				if (JSON.stringify(firstOldPath) === JSON.stringify(newPath)) {
+					this._pendingCollectionPathChanges.delete(collectionID);
+				}
+				else {
+					this._pendingCollectionPathChanges.set(collectionID, {
+						collectionID,
+						oldPath: firstOldPath,
+						newPath
+					});
+				}
+			}
 			let ids = Array.isArray(itemIDs) ? itemIDs : [itemIDs];
 			for (let id of ids) {
 				if (id) {
 					this._pendingAttachmentFileIDItemIDs.add(id);
+					if (options.runAutomaticPDFOperations) {
+						this._pendingAutomaticPDFOperationItemIDs.add(Number(id));
+					}
+				}
+			}
+			for (let id of options.automaticOperationItemIDs || []) {
+				id = Number(id);
+				if (Number.isInteger(id) && id > 0) {
+					this._pendingAutomaticPDFOperationItemIDs.add(id);
 				}
 			}
 			if (!this._pendingAttachmentFileIDItemIDs.size) {
@@ -460,11 +1337,15 @@
 			let diagnosticsEnabled = this._pendingAttachmentFileIDDiagnostics;
 			let preferredPrimaryCollectionIDs = new Map(this._pendingPreferredPrimaryCollectionIDs);
 			let removedCollectionIDs = new Map(this._pendingRemovedCollectionIDs);
+			let collectionPathChanges = Array.from(this._pendingCollectionPathChanges.values());
+			let automaticPDFOperationItemIDs = new Set(this._pendingAutomaticPDFOperationItemIDs);
 			let diagnosticLines = [];
 			this._pendingAttachmentFileIDItemIDs.clear();
 			this._pendingAttachmentFileIDDiagnostics = false;
 			this._pendingPreferredPrimaryCollectionIDs.clear();
 			this._pendingRemovedCollectionIDs.clear();
+			this._pendingCollectionPathChanges.clear();
+			this._pendingAutomaticPDFOperationItemIDs.clear();
 			if (!ids.length) {
 				return;
 			}
@@ -487,11 +1368,15 @@
 			let synced = 0;
 			let skipped = 0;
 			let retryItemIDs = [];
+			let retryAutomaticOperationItemIDs = [];
 			for (let attachment of attachments) {
 				try {
 					let moveResult = await this.autoMoveStoredAttachmentToCollectionPath(attachment);
 					if (moveResult.ok) {
 						changed = true;
+					}
+					if (this.shouldRunAutomaticPDFOperationsForAttachment(attachment, automaticPDFOperationItemIDs)) {
+						await this.runAutomaticPDFOperations(attachment, { firstImport: true });
 					}
 					if (!(await this.isAttachmentFileIDIndexCurrent(attachment, index))) {
 						let result = await this.indexAttachmentFileID(attachment, {
@@ -502,6 +1387,9 @@
 						changed = changed || Boolean(result.ok);
 						if (!result.ok && this.shouldRetryAttachmentFileIDIndexing(result.reason)) {
 							retryItemIDs.push(attachment.id);
+							if (this.shouldRunAutomaticPDFOperationsForAttachment(attachment, automaticPDFOperationItemIDs)) {
+								retryAutomaticOperationItemIDs.push(attachment.id);
+							}
 						}
 					}
 					let syncResult = await this.syncAttachmentMirrors(attachment, {
@@ -509,10 +1397,10 @@
 						save: false,
 						diagnostics: diagnosticsEnabled ? [] : null,
 						preferredCollectionID: preferredPrimaryCollectionIDs.get(attachment.parentItem?.id),
-						removedCollectionIDs: removedCollectionIDs.get(attachment.parentItem?.id) || []
+						removedCollectionIDs: removedCollectionIDs.get(attachment.parentItem?.id) || [],
+						collectionPathChanges
 					});
 					changed = changed || Boolean(syncResult.changed);
-					await this.runAutomaticPDFOperations(attachment);
 					this._attachmentFileIDRetryCounts.delete(attachment.id);
 					synced++;
 					if (diagnosticsEnabled) {
@@ -531,7 +1419,7 @@
 			if (changed) {
 				this.setAttachmentFileIndex(index);
 			}
-			this.scheduleAttachmentFileIDRetries(retryItemIDs);
+			this.scheduleAttachmentFileIDRetries(retryItemIDs, retryAutomaticOperationItemIDs);
 			if (diagnosticsEnabled) {
 				this.showHardlinkDiagnostic([
 					"已触发指定条目的 collection 变化同步。",
@@ -550,7 +1438,12 @@
 			return /源文件不存在|无法读取机内码/.test(String(reason || ""));
 		},
 
-		scheduleAttachmentFileIDRetries(itemIDs) {
+		shouldRunAutomaticPDFOperationsForAttachment(attachment, itemIDs) {
+			return itemIDs?.has?.(Number(attachment?.id))
+				|| itemIDs?.has?.(Number(attachment?.parentItem?.id));
+		},
+
+		scheduleAttachmentFileIDRetries(itemIDs, automaticOperationItemIDs = []) {
 			let retryIDs = [];
 			for (let itemID of itemIDs || []) {
 				itemID = Number(itemID);
@@ -565,7 +1458,10 @@
 				retryIDs.push(itemID);
 			}
 			if (retryIDs.length) {
-				this.scheduleAttachmentFileIDIndexing(retryIDs, { delay: 15000 });
+				this.scheduleAttachmentFileIDIndexing(retryIDs, {
+					delay: 15000,
+					automaticOperationItemIDs
+				});
 			}
 		},
 
@@ -785,58 +1681,31 @@
 					return;
 				}
 
-				if (action === "indexAllAttachments") {
-					let originalLabel = button?.getAttribute?.("label") || "初始化全库附件机内码";
+				if (action === "repairAllLibraryLinks") {
+					let originalLabel = button?.getAttribute?.("label") || "检查并修复全库附件链接";
 					if (button) {
 						button.disabled = true;
-						button.setAttribute("label", "正在初始化...");
+						button.setAttribute("label", "准备检查...");
 					}
 					this.runPreferenceBackgroundAction(button, originalLabel, async () => {
-						await this.indexAllLibraryAttachmentFileIDs({
-							useProgressWindow: false,
-							softReport: true,
-							suppressSoftProgress: true,
+						await this.repairAllLibraryAttachmentLinksByFileID({
 							onProgress: ({ processed, total }) => {
-								button?.setAttribute?.("label", `正在初始化 ${processed}/${total}`);
+								button?.setAttribute?.("label", `链接 ${processed}/${total}`);
 							}
 						});
-					}, "全库附件机内码初始化失败");
+					}, "ZotLink 全库附件链接检查失败");
 					return;
 				}
 
-				if (action === "writeAllPDFDOIMetadata") {
-					let originalLabel = button?.getAttribute?.("label") || "写入全库 PDF DOI 元数据并对齐页码";
+				if (action === "updateAllLibrary") {
+					let originalLabel = button?.getAttribute?.("label") || "按勾选项目更新全库";
 					if (button) {
 						button.disabled = true;
-						button.setAttribute("label", "正在写入/对齐...");
+						button.setAttribute("label", "准备更新...");
 					}
 					this.runPreferenceBackgroundAction(button, originalLabel, async () => {
-						await this.writeAllLibraryPDFDOIMetadata({
-							useProgressWindow: false,
-							softReport: true,
-							onProgress: ({ processed, total }) => {
-								button?.setAttribute?.("label", `正在处理 ${processed}/${total}`);
-							}
-						});
-					}, "全库 PDF DOI 元数据写入与页码对齐失败");
-					return;
-				}
-
-				if (action === "writeAllArticleHistory") {
-					let originalLabel = button?.getAttribute?.("label") || "提取全库文章历史时间线";
-					if (button) {
-						button.disabled = true;
-						button.setAttribute("label", "正在提取...");
-					}
-					this.runPreferenceBackgroundAction(button, originalLabel, async () => {
-						await this.writeAllLibraryArticleHistory({
-							useProgressWindow: false,
-							softReport: true,
-							onProgress: ({ processed, total }) => {
-								button?.setAttribute?.("label", `正在提取 ${processed}/${total}`);
-							}
-						});
-					}, "全库文章历史时间线提取失败");
+						await this.updateAllLibraryBySelectedOptions({ button });
+					}, "ZotLink 全库更新失败");
 					return;
 				}
 
@@ -877,6 +1746,74 @@
 				Zotero.logError(e);
 				this.showPreferenceAlert("设置按钮错误", this.errorToText(e) || String(e));
 			}
+		},
+
+		async updateAllLibraryBySelectedOptions(options = {}) {
+			let button = options.button;
+			let selected = {
+				doi: this.getBoolPref("autoWritePDFDOIMetadata", true),
+				pageLabels: this.getBoolPref("autoAlignPDFPageLabels", true),
+				openFirstPage: this.getBoolPref("autoSetPDFOpenToFirstPage", true),
+				displayFileName: this.getBoolPref("autoSetPDFDisplayTitleFileName", true),
+				articleHistory: this.getBoolPref("autoExtractArticleHistory", false)
+			};
+			if (!Object.values(selected).some(Boolean)) {
+				this.showSoftReport("未勾选任何可用于全库更新的项目。", 5000);
+				return;
+			}
+
+			let summaries = [];
+			let startedAt = Date.now();
+			button?.setAttribute?.("label", "正在检查附件链接...");
+			let linkResult = await this.repairAllLibraryAttachmentLinksByFileID({
+				silent: true,
+				onProgress: ({ processed, total }) => {
+					button?.setAttribute?.("label", `链接 ${processed}/${total}`);
+				}
+			});
+			if (linkResult?.repaired) {
+				summaries.push(`链接修复 ${linkResult.repaired}`);
+			}
+			if (selected.doi || selected.pageLabels || selected.openFirstPage || selected.displayFileName) {
+				button?.setAttribute?.("label", "正在处理 PDF...");
+				let result = await this.writeAllLibraryPDFDOIMetadata({
+					useProgressWindow: false,
+					silent: true,
+					requireManagedPath: true,
+					writeDOIMetadata: selected.doi,
+					alignPageLabels: selected.pageLabels,
+					openToFirstPage: selected.openFirstPage,
+					displayTitleFileName: selected.displayFileName,
+					onProgress: ({ processed, total }) => {
+						button?.setAttribute?.("label", `PDF ${processed}/${total}`);
+					}
+				});
+				if (selected.doi) {
+					summaries.push(`DOI 元数据更新 ${result?.written || 0}`);
+				}
+				if (selected.pageLabels) {
+					summaries.push(`页码对齐 ${result?.pageLabelsAligned || 0}`);
+				}
+				if (selected.openFirstPage || selected.displayFileName) {
+					summaries.push(`查看设置更新 ${result?.viewerPreferencesUpdated || 0}`);
+				}
+			}
+
+			if (selected.articleHistory) {
+				button?.setAttribute?.("label", "正在提取文章历史...");
+				let result = await this.writeAllLibraryArticleHistory({
+					useProgressWindow: false,
+					silent: true,
+					requireManagedPath: true,
+					onProgress: ({ processed, total }) => {
+						button?.setAttribute?.("label", `文章历史 ${processed}/${total}`);
+					}
+				});
+				summaries.push(`文章历史写入 ${result?.written || 0}`);
+			}
+
+			let seconds = Math.round((Date.now() - startedAt) / 1000);
+			this.showSoftReport(`全库更新完成：${summaries.join("；")}。耗时约 ${seconds} 秒。`, 9000);
 		},
 
 		runPreferenceBackgroundAction(button, originalLabel, task, failureTitle) {
@@ -940,8 +1877,8 @@
 			}
 		},
 
-		updateCurrentShortcutLabel(doc, shortcut) {
-			let label = doc.getElementById("zotlink-current-shortcut");
+		updateCurrentShortcutLabel(doc, shortcut, labelID = "zotlink-current-shortcut") {
+			let label = doc.getElementById(labelID);
 			if (!label) {
 				return;
 			}
@@ -956,21 +1893,32 @@
 		},
 
 		captureShortcutInput(event, input) {
+			let labelID = this.getShortcutLabelIDForInput(input);
 			let shortcut = this.shortcutFromKeyboardEvent(event);
 			if (!shortcut) {
 				if (event.key === "Backspace" || event.key === "Delete" || event.key === "Escape") {
 					this.setInputValue(input, "");
-					this.updateCurrentShortcutLabel(input.ownerDocument, "");
+					this.updateCurrentShortcutLabel(input.ownerDocument, "", labelID);
 					this.saveAttachmentPreferenceInputs(input.ownerDocument);
 					event.preventDefault();
 				}
 				return;
 			}
 			this.setInputValue(input, shortcut);
-			this.updateCurrentShortcutLabel(input.ownerDocument, shortcut);
+			this.updateCurrentShortcutLabel(input.ownerDocument, shortcut, labelID);
 			this.saveAttachmentPreferenceInputs(input.ownerDocument);
 			event.preventDefault();
 			event.stopPropagation();
+		},
+
+		getShortcutLabelIDForInput(input) {
+			if (input?.id === "zotlink-copy-link-shortcut") {
+				return "zotlink-current-copy-link-shortcut";
+			}
+			if (input?.id === "zotlink-copy-obsidian-link-shortcut") {
+				return "zotlink-current-copy-obsidian-link-shortcut";
+			}
+			return "zotlink-current-shortcut";
 		},
 
 		shortcutFromKeyboardEvent(event) {
@@ -1151,7 +2099,14 @@
 				let shortcut = this.getPref("attachmentMoveShortcut", "");
 				this.setInputValue(shortcutInput, shortcut);
 				this.updateCurrentShortcutLabel(doc, shortcut);
-				this.setPref("autoRenameAttachmentsEnabled", false);
+				let copyLinkShortcutInput = doc.getElementById("zotlink-copy-link-shortcut");
+				let copyLinkShortcut = this.getPref("copyLinkShortcut", "");
+				this.setInputValue(copyLinkShortcutInput, copyLinkShortcut);
+				this.updateCurrentShortcutLabel(doc, copyLinkShortcut, "zotlink-current-copy-link-shortcut");
+				let copyObsidianLinkShortcutInput = doc.getElementById("zotlink-copy-obsidian-link-shortcut");
+				let copyObsidianLinkShortcut = this.getPref("copyObsidianLinkShortcut", "");
+				this.setInputValue(copyObsidianLinkShortcutInput, copyObsidianLinkShortcut);
+				this.updateCurrentShortcutLabel(doc, copyObsidianLinkShortcut, "zotlink-current-copy-obsidian-link-shortcut");
 				this.initializePreferenceCheckboxes(doc);
 				this.attachPreferenceAutoSaveHandlers(doc);
 			}
@@ -1163,10 +2118,12 @@
 		getPDFOperationPreferenceDefinitions() {
 			return [
 				["zotlink-auto-write-doi-metadata", "autoWritePDFDOIMetadata", true],
+				["zotlink-auto-rename-new-attachments", "autoRenameNewAttachments", false],
 				["zotlink-auto-align-page-labels", "autoAlignPDFPageLabels", true],
 				["zotlink-auto-set-open-first-page", "autoSetPDFOpenToFirstPage", true],
 				["zotlink-auto-display-title-filename", "autoSetPDFDisplayTitleFileName", true],
-				["zotlink-auto-extract-article-history", "autoExtractArticleHistory", false]
+				["zotlink-auto-extract-article-history", "autoExtractArticleHistory", false],
+				["zotlink-use-alert-for-collection-import-completion", "useAlertForCollectionImportCompletion", false]
 			];
 		},
 
@@ -1182,6 +2139,8 @@
 		attachPreferenceAutoSaveHandlers(doc) {
 			let rootInput = doc.getElementById("zotlink-move-root");
 			let shortcutInput = doc.getElementById("zotlink-move-shortcut");
+			let copyLinkShortcutInput = doc.getElementById("zotlink-copy-link-shortcut");
+			let copyObsidianLinkShortcutInput = doc.getElementById("zotlink-copy-obsidian-link-shortcut");
 			if (rootInput && !rootInput.dataset.zotlinkAutoSaveAttached) {
 				rootInput.dataset.zotlinkAutoSaveAttached = "true";
 				rootInput.addEventListener("input", () => this.schedulePreferenceAutoSave(doc));
@@ -1192,6 +2151,16 @@
 				shortcutInput.dataset.zotlinkAutoSaveAttached = "true";
 				shortcutInput.addEventListener("change", () => this.saveAttachmentPreferenceInputs(doc));
 				shortcutInput.addEventListener("blur", () => this.saveAttachmentPreferenceInputs(doc));
+			}
+			if (copyLinkShortcutInput && !copyLinkShortcutInput.dataset.zotlinkAutoSaveAttached) {
+				copyLinkShortcutInput.dataset.zotlinkAutoSaveAttached = "true";
+				copyLinkShortcutInput.addEventListener("change", () => this.saveAttachmentPreferenceInputs(doc));
+				copyLinkShortcutInput.addEventListener("blur", () => this.saveAttachmentPreferenceInputs(doc));
+			}
+			if (copyObsidianLinkShortcutInput && !copyObsidianLinkShortcutInput.dataset.zotlinkAutoSaveAttached) {
+				copyObsidianLinkShortcutInput.dataset.zotlinkAutoSaveAttached = "true";
+				copyObsidianLinkShortcutInput.addEventListener("change", () => this.saveAttachmentPreferenceInputs(doc));
+				copyObsidianLinkShortcutInput.addEventListener("blur", () => this.saveAttachmentPreferenceInputs(doc));
 			}
 			for (let [elementID] of this.getPDFOperationPreferenceDefinitions()) {
 				let checkbox = doc.getElementById(elementID);
@@ -1219,15 +2188,31 @@
 				let root = doc.getElementById("zotlink-move-root")?.value?.trim() || "";
 				let shortcutInput = doc.getElementById("zotlink-move-shortcut");
 				let shortcut = this.normalizeShortcutText(shortcutInput?.value?.trim() || "");
+				let copyLinkShortcutInput = doc.getElementById("zotlink-copy-link-shortcut");
+				let copyLinkShortcut = this.normalizeShortcutText(copyLinkShortcutInput?.value?.trim() || "");
+				let copyObsidianLinkShortcutInput = doc.getElementById("zotlink-copy-obsidian-link-shortcut");
+				let copyObsidianLinkShortcut = this.normalizeShortcutText(copyObsidianLinkShortcutInput?.value?.trim() || "");
 				if (shortcutInput) {
 					this.setInputValue(shortcutInput, shortcut);
 				}
-				if (shortcut && !this.parseShortcut(shortcut)) {
+				if (copyLinkShortcutInput) {
+					this.setInputValue(copyLinkShortcutInput, copyLinkShortcut);
+				}
+				if (copyObsidianLinkShortcutInput) {
+					this.setInputValue(copyObsidianLinkShortcutInput, copyObsidianLinkShortcut);
+				}
+				if (!this.validateShortcutPreferences([
+					{ label: "移动快捷键", shortcut },
+					{ label: "复制 DOI/URL 链接快捷键", shortcut: copyLinkShortcut },
+					{ label: "复制 Obsidian 文献链接快捷键", shortcut: copyObsidianLinkShortcut }
+				])) {
+					this.restoreShortcutPreferenceInputs(doc);
 					return;
 				}
 				this.setPref("attachmentMoveRoot", root);
 				this.setPref("attachmentMoveShortcut", shortcut);
-				this.setPref("autoRenameAttachmentsEnabled", false);
+				this.setPref("copyLinkShortcut", copyLinkShortcut);
+				this.setPref("copyObsidianLinkShortcut", copyObsidianLinkShortcut);
 				for (let [elementID, prefKey] of this.getPDFOperationPreferenceDefinitions()) {
 					let checkbox = doc.getElementById(elementID);
 					if (checkbox) {
@@ -1235,10 +2220,51 @@
 					}
 				}
 				this.updateCurrentShortcutLabel(doc, shortcut);
+				this.updateCurrentShortcutLabel(doc, copyLinkShortcut, "zotlink-current-copy-link-shortcut");
+				this.updateCurrentShortcutLabel(doc, copyObsidianLinkShortcut, "zotlink-current-copy-obsidian-link-shortcut");
 				this.registerShortcut();
 			}
 			catch (e) {
 				Zotero.logError(e);
+			}
+		},
+
+		validateShortcutPreferences(definitions) {
+			let signatures = new Map();
+			for (let definition of definitions) {
+				if (!definition.shortcut) {
+					continue;
+				}
+				let parsed = this.parseShortcut(definition.shortcut);
+				if (!parsed) {
+					this.showStatus(`${definition.label}无效`, 3000);
+					return false;
+				}
+				let signature = this.shortcutSignature(parsed);
+				if (signatures.has(signature)) {
+					this.showStatus(`${definition.label}与${signatures.get(signature)}冲突`, 3500);
+					return false;
+				}
+				signatures.set(signature, definition.label);
+				let conflict = this.findShortcutConflict(definition.shortcut);
+				if (conflict) {
+					this.showStatus(`${definition.label}与已有快捷键冲突：${conflict}`, 4500);
+					return false;
+				}
+			}
+			return true;
+		},
+
+		restoreShortcutPreferenceInputs(doc) {
+			let shortcuts = [
+				["zotlink-move-shortcut", "attachmentMoveShortcut", "zotlink-current-shortcut"],
+				["zotlink-copy-link-shortcut", "copyLinkShortcut", "zotlink-current-copy-link-shortcut"],
+				["zotlink-copy-obsidian-link-shortcut", "copyObsidianLinkShortcut", "zotlink-current-copy-obsidian-link-shortcut"]
+			];
+			for (let [inputID, prefKey, labelID] of shortcuts) {
+				let value = this.getPref(prefKey, "");
+				this.setInputValue(doc.getElementById(inputID), value);
+				this.updateCurrentShortcutLabel(doc, value, labelID);
 			}
 		},
 
@@ -1255,6 +2281,18 @@
 
 			let popup = doc.createXULElement("menupopup");
 			root.appendChild(popup);
+
+			let copyItemLinkItem = doc.createXULElement("menuitem");
+			copyItemLinkItem.setAttribute("label", "复制 DOI/URL 链接");
+			copyItemLinkItem.addEventListener("command", () => this.copySelectedItemLink());
+			popup.appendChild(copyItemLinkItem);
+
+			let copyObsidianLinkItem = doc.createXULElement("menuitem");
+			copyObsidianLinkItem.setAttribute("label", "复制 Obsidian 文献链接");
+			copyObsidianLinkItem.addEventListener("command", () => this.copySelectedObsidianItemLink());
+			popup.appendChild(copyObsidianLinkItem);
+
+			popup.appendChild(doc.createXULElement("menuseparator"));
 
 			let moveAttachmentsItem = doc.createXULElement("menuitem");
 			moveAttachmentsItem.setAttribute("label", "移动附件到集合目录");
@@ -1290,11 +2328,132 @@
 			this._menuElements.push(root);
 		},
 
-		registerCollectionMenu(win) {
-			let doc = win.document;
-			if (doc.getElementById(COLLECTION_MENU_ID)) {
+		async copySelectedItemLink() {
+			let itemResult = this.getSelectedRegularItemForLinkCopy();
+			if (!itemResult.ok) {
+				this.showStatus(itemResult.reason, 3000);
+				return itemResult;
+			}
+
+			let link = this.getPreferredLiteratureLink(itemResult.item);
+			if (!link.value) {
+				this.showStatus("所选文献没有 DOI 或 URL", 3500);
+				return { ok: false, reason: "所选文献没有 DOI 或 URL" };
+			}
+
+			try {
+				await this.copyTextToClipboard(link.value);
+				this.showStatus(`已复制 ${link.source} 链接`, 2500);
+				return { ok: true, value: link.value, source: link.source };
+			}
+			catch (e) {
+				Zotero.logError(e);
+				this.showStatus("复制链接失败", 3500);
+				return { ok: false, reason: this.errorToText(e) || "复制链接失败" };
+			}
+		},
+
+		async copySelectedObsidianItemLink() {
+			let itemResult = this.getSelectedRegularItemForLinkCopy();
+			if (!itemResult.ok) {
+				this.showStatus(itemResult.reason, 3000);
+				return itemResult;
+			}
+
+			let item = itemResult.item;
+			let link = this.getPreferredLiteratureLink(item);
+			if (!link.value) {
+				this.showStatus("所选文献没有 DOI 或 URL", 3500);
+				return { ok: false, reason: "所选文献没有 DOI 或 URL" };
+			}
+
+			let attachment = itemResult.attachment && this.isPDFFilePath(itemResult.attachment.getFilePath?.(), itemResult.attachment)
+				? itemResult.attachment
+				: await this.getPrimaryPDFAttachmentForItem(item);
+			let pdfLink = this.getZoteroOpenPDFLink(attachment);
+			if (!pdfLink) {
+				this.showStatus("所选文献没有可引用的主 PDF 附件", 3500);
+				return { ok: false, reason: "所选文献没有可引用的主 PDF 附件" };
+			}
+
+			let value = `[🔗](${link.value}) [📚](${pdfLink})`;
+			try {
+				await this.copyTextToClipboard(value);
+				this.showStatus("已复制 Obsidian 文献链接", 2500);
+				return { ok: true, value, source: link.source, pdfLink };
+			}
+			catch (e) {
+				Zotero.logError(e);
+				this.showStatus("复制 Obsidian 文献链接失败", 3500);
+				return { ok: false, reason: this.errorToText(e) || "复制 Obsidian 文献链接失败" };
+			}
+		},
+
+		getSelectedRegularItemForLinkCopy() {
+			let selectedItems = Zotero.getActiveZoteroPane?.()?.getSelectedItems?.() || [];
+			if (selectedItems.length !== 1) {
+				return { ok: false, reason: "请只选择一篇文献" };
+			}
+
+			let item = selectedItems[0];
+			let attachment = null;
+			if (item?.isAttachment?.()) {
+				attachment = item;
+				item = item.parentItem;
+			}
+			if (!item?.isRegularItem?.()) {
+				return { ok: false, reason: "所选内容不是文献条目" };
+			}
+			return { ok: true, item, attachment };
+		},
+
+		getPreferredLiteratureLink(item) {
+			let doi = this.normalizeDOI(item?.getField?.("DOI"));
+			let value = /^10\.\d{4,9}\/.+/i.test(doi) ? `https://doi.org/${doi}` : "";
+			if (value) {
+				return { value, source: "DOI" };
+			}
+			value = String(item?.getField?.("url") || item?.getField?.("URL") || "").trim();
+			return { value, source: value ? "URL" : "" };
+		},
+
+		getZoteroOpenPDFLink(attachment) {
+			if (!attachment?.key) {
+				return "";
+			}
+			if (Number(attachment.libraryID) === Number(Zotero.Libraries.userLibraryID)) {
+				return `zotero://open-pdf/library/items/${attachment.key}`;
+			}
+			try {
+				let library = Zotero.Libraries.get(attachment.libraryID);
+				let groupID = library?.libraryType === "group" ? library?.id : null;
+				if (groupID) {
+					return `zotero://open-pdf/groups/${groupID}/items/${attachment.key}`;
+				}
+			}
+			catch (e) {
+				Zotero.debug("ZotLink: failed to build group PDF link", 1);
+			}
+			return `zotero://open-pdf/library/items/${attachment.key}`;
+		},
+
+		async copyTextToClipboard(text) {
+			let copy = Zotero.Utilities?.Internal?.copyTextToClipboard;
+			if (typeof copy === "function") {
+				await copy.call(Zotero.Utilities.Internal, text);
 				return;
 			}
+			let components = typeof Components !== "undefined" ? Components : null;
+			let helper = components?.classes?.["@mozilla.org/widget/clipboardhelper;1"]
+				?.getService?.(components.interfaces.nsIClipboardHelper);
+			if (!helper) {
+				throw new Error("剪贴板服务不可用");
+			}
+			helper.copyString(text);
+		},
+
+		registerCollectionMenu(win) {
+			let doc = win.document;
 			let menu = this.getCollectionContextMenu(doc);
 			if (!menu) {
 				Zotero.debug("ZotLink: collection context menu not found", 1);
@@ -1303,15 +2462,17 @@
 			}
 
 			this.appendCollectionMenu(doc, menu);
+			this.registerCollectionMenuFallback(win);
 		},
 
 		appendCollectionMenu(doc, menu) {
-			if (!doc || !menu || doc.getElementById(COLLECTION_MENU_ID)) {
+			if (!doc || !menu || this.hasZotLinkCollectionMenu(menu)) {
 				return false;
 			}
 
 			let root = doc.createXULElement("menu");
-			root.id = COLLECTION_MENU_ID;
+			root.id = `${COLLECTION_MENU_ID}-${this._menuElements.length + 1}`;
+			root.setAttribute("data-zotlink-collection-menu", "true");
 			root.setAttribute("label", PLUGIN_NAME);
 
 			let popup = doc.createXULElement("menupopup");
@@ -1319,17 +2480,37 @@
 
 			let importPDFsItem = doc.createXULElement("menuitem");
 			importPDFsItem.setAttribute("label", "仅导入当前文件夹 PDF");
-			importPDFsItem.addEventListener("command", () => this.importPDFsFromSelectedCollectionFolder({ recursive: false }));
+			this.attachCollectionImportMenuAction(importPDFsItem, { recursive: false });
 			popup.appendChild(importPDFsItem);
 
 			let importPDFsRecursiveItem = doc.createXULElement("menuitem");
 			importPDFsRecursiveItem.setAttribute("label", "导入当前文件夹及子文件夹 PDF");
-			importPDFsRecursiveItem.addEventListener("command", () => this.importPDFsFromSelectedCollectionFolder({ recursive: true }));
+			this.attachCollectionImportMenuAction(importPDFsRecursiveItem, { recursive: true });
 			popup.appendChild(importPDFsRecursiveItem);
 
 			menu.appendChild(root);
 			this._menuElements.push(root);
 			return true;
+		},
+
+		hasZotLinkCollectionMenu(menu) {
+			return Boolean(menu?.querySelector?.('[data-zotlink-collection-menu="true"]'));
+		},
+
+		attachCollectionImportMenuAction(menuItem, options) {
+			let trigger = event => {
+				if (event?.type === "click" && event.button !== 0) {
+					return;
+				}
+				let now = Date.now();
+				if (menuItem._zotlinkLastTriggerAt && now - menuItem._zotlinkLastTriggerAt < 500) {
+					return;
+				}
+				menuItem._zotlinkLastTriggerAt = now;
+				this.importPDFsFromSelectedCollectionFolder(options).catch(e => Zotero.logError(e));
+			};
+			menuItem.addEventListener("command", trigger);
+			menuItem.addEventListener("click", trigger);
 		},
 
 		getCollectionContextMenu(doc) {
@@ -1361,7 +2542,7 @@
 
 			let handler = event => {
 				let menu = event.target;
-				if (!menu || doc.getElementById(COLLECTION_MENU_ID)) {
+				if (!menu || this.hasZotLinkCollectionMenu(menu)) {
 					return;
 				}
 				if (!this.isLikelyCollectionContextMenu(menu)) {
@@ -1398,7 +2579,9 @@
 			if (!doc) {
 				return;
 			}
-			doc.getElementById(COLLECTION_MENU_ID)?.remove();
+			for (let element of Array.from(doc.querySelectorAll?.('[data-zotlink-collection-menu="true"]') || [])) {
+				element.remove();
+			}
 			this.unregisterCollectionMenuFallback(win);
 			this._menuElements = this._menuElements.filter(element => element.ownerDocument !== doc);
 		},
@@ -1412,46 +2595,82 @@
 
 		unregisterWindowMenus(win) {
 			let doc = win.document;
-			for (let id of [ITEM_MENU_ID, COLLECTION_MENU_ID]) {
+			for (let id of [ITEM_MENU_ID]) {
 				doc.getElementById(id)?.remove();
+			}
+			for (let element of Array.from(doc.querySelectorAll?.('[data-zotlink-collection-menu="true"]') || [])) {
+				element.remove();
 			}
 			this.unregisterCollectionMenuFallback(win);
 			this._menuElements = this._menuElements.filter(element => element.ownerDocument !== doc);
 		},
 
 		registerShortcut(win) {
-			let shortcut = String(this.getPref("attachmentMoveShortcut", "") || "").trim();
-			if (!shortcut) {
-				return;
-			}
-
-			let parsed = this.parseShortcut(shortcut);
-			if (!parsed) {
-				Zotero.debug(`ZotLink: invalid shortcut ${shortcut}`, 1);
+			if (!win) {
+				for (let mainWindow of Zotero.getMainWindows()) {
+					this.registerShortcut(mainWindow);
+				}
 				return;
 			}
 
 			let doc = win.document;
 			this.unregisterWindowShortcuts(win);
-
 			let keyset = doc.getElementById("mainKeyset") || doc.documentElement;
-			let key = doc.createXULElement("key");
-			key.id = MOVE_SHORTCUT_KEY_ID;
-			key.setAttribute(parsed.key.length === 1 ? "key" : "keycode", parsed.key);
-			key.setAttribute("modifiers", parsed.modifiers.join(","));
-			key.addEventListener("command", () => this.moveSelectedAttachmentsToCollectionPath());
-			keyset.appendChild(key);
-			this._shortcutElements.push(key);
+			let definitions = [
+				{
+					id: MOVE_SHORTCUT_KEY_ID,
+					shortcut: String(this.getPref("attachmentMoveShortcut", "") || "").trim(),
+					action: () => this.moveSelectedAttachmentsToCollectionPath()
+				},
+				{
+					id: COPY_LINK_SHORTCUT_KEY_ID,
+					shortcut: String(this.getPref("copyLinkShortcut", "") || "").trim(),
+					action: () => this.copySelectedItemLink()
+				},
+				{
+					id: COPY_OBSIDIAN_LINK_SHORTCUT_KEY_ID,
+					shortcut: String(this.getPref("copyObsidianLinkShortcut", "") || "").trim(),
+					action: () => this.copySelectedObsidianItemLink()
+				}
+			];
+			let registered = [];
+			let signatures = new Set();
+			for (let definition of definitions) {
+				if (!definition.shortcut) {
+					continue;
+				}
+				let parsed = this.parseShortcut(definition.shortcut);
+				let signature = this.shortcutSignature(parsed);
+				if (!parsed || !signature || signatures.has(signature)) {
+					Zotero.debug(`ZotLink: invalid or duplicate shortcut ${definition.shortcut}`, 1);
+					continue;
+				}
+				signatures.add(signature);
+				let keyset = doc.getElementById("mainKeyset") || doc.documentElement;
+				let key = doc.createXULElement("key");
+				key.id = definition.id;
+				key.setAttribute(parsed.key.length === 1 ? "key" : "keycode", parsed.key);
+				key.setAttribute("modifiers", parsed.modifiers.join(","));
+				key.addEventListener("command", definition.action);
+				keyset.appendChild(key);
+				this._shortcutElements.push(key);
+				registered.push({ parsed, action: definition.action });
+			}
 
 			let handler = event => {
-				if (this.keyboardEventMatchesShortcut(event, parsed)) {
-					event.preventDefault();
-					event.stopPropagation();
-					this.moveSelectedAttachmentsToCollectionPath();
+				for (let definition of registered) {
+					if (this.keyboardEventMatchesShortcut(event, definition.parsed)) {
+						event.preventDefault();
+						event.stopPropagation();
+						definition.action();
+						return;
+					}
 				}
 			};
-			doc.addEventListener("keydown", handler, true);
-			this._shortcutHandlers.set(win, handler);
+			if (registered.length) {
+				doc.addEventListener("keydown", handler, true);
+				this._shortcutHandlers.set(win, handler);
+			}
 		},
 
 		findShortcutConflict(shortcut) {
@@ -1463,7 +2682,7 @@
 			for (let win of Zotero.getMainWindows()) {
 				let doc = win.document;
 				for (let keyElement of doc.querySelectorAll("key")) {
-					if (keyElement.id === MOVE_SHORTCUT_KEY_ID) {
+					if ([MOVE_SHORTCUT_KEY_ID, COPY_LINK_SHORTCUT_KEY_ID, COPY_OBSIDIAN_LINK_SHORTCUT_KEY_ID].includes(keyElement.id)) {
 						continue;
 					}
 					let signature = this.shortcutSignature({
@@ -1502,6 +2721,8 @@
 		unregisterWindowShortcuts(win) {
 			let doc = win.document;
 			doc.getElementById(MOVE_SHORTCUT_KEY_ID)?.remove();
+			doc.getElementById(COPY_LINK_SHORTCUT_KEY_ID)?.remove();
+			doc.getElementById(COPY_OBSIDIAN_LINK_SHORTCUT_KEY_ID)?.remove();
 			let handler = this._shortcutHandlers.get(win);
 			if (handler) {
 				doc.removeEventListener("keydown", handler, true);
@@ -1653,107 +2874,296 @@
 
 		async importPDFsFromSelectedCollectionFolder(options = {}) {
 			let recursive = !!options.recursive;
-			let pane = Zotero.getActiveZoteroPane();
-			let collectionID = this.getSelectedCollectionID(pane);
-			if (!collectionID) {
-				this.showSoftReport("请先在左侧选择一个 collection。");
+			let modeText = recursive ? "递归导入分类文件夹 PDF" : "导入当前分类文件夹 PDF";
+			if (this._collectionPDFImportRunning) {
+				this.showStatus(`ZotLink ${modeText}已在进行中`, 3500);
 				return;
 			}
-
-			let root = this.getAttachmentMoveRoot();
-			if (!root) {
-				root = this.promptForAttachmentMoveRoot();
-				if (!root) {
-					this.showSoftReport("请先在设置中填写附件移动顶层路径");
+			this._collectionPDFImportRunning = true;
+			let startedAt = Date.now();
+			try {
+				let pane = Zotero.getActiveZoteroPane();
+				let collectionID = this.getSelectedCollectionID(pane);
+				if (!collectionID) {
+					this.showSoftReport("请先在左侧选择一个 collection。");
 					return;
 				}
-			}
 
-			let collectionPath = this.getCollectionPathByID(collectionID);
-			if (!collectionPath.length) {
-				this.showSoftReport("无法解析当前 collection 的文件夹路径。");
-				return;
-			}
-
-			let folderPath = PathUtils.join(root, ...collectionPath);
-			if (!(await IOUtils.exists(folderPath))) {
-				this.showSoftReport(`Collection 对应文件夹不存在：${folderPath}`, 8000);
-				return;
-			}
-
-			let pdfEntries = recursive
-				? await this.getPDFImportEntriesRecursive(folderPath, collectionID)
-				: await this.getPDFImportEntriesShallow(folderPath, collectionID);
-			let pdfs = pdfEntries.map(entry => entry.path);
-			if (!pdfs.length) {
-				this.showSoftReport(`未在文件夹中找到 PDF：${folderPath}`, 8000);
-				return;
-			}
-
-			let existingDOICache = new Map();
-			let imported = 0;
-			let skipped = 0;
-			let reasons = new Map();
-			let index = this.getAttachmentFileIndex();
-			let headline = recursive ? "正在递归导入 Collection 文件夹 PDF" : "正在从当前 Collection 文件夹导入 PDF";
-			let progressWindow = this.createProgressWindow(headline, `已处理 0 / ${pdfs.length}`);
-
-			for (let i = 0; i < pdfEntries.length; i++) {
-				let entry = pdfEntries[i];
-				let pdfPath = entry.path;
-				let targetCollectionID = entry.collectionID || collectionID;
-				try {
-					let doi = await this.extractDOIFromPDFMetadata(pdfPath);
-					if (!doi) {
-						skipped++;
-						this.countReason(reasons, "未发现 DOI");
-						continue;
+				let root = this.getAttachmentMoveRoot();
+				if (!root) {
+					root = this.promptForAttachmentMoveRoot();
+					if (!root) {
+						this.showSoftReport("请先在设置中填写附件移动顶层路径");
+						return;
 					}
-					let doiKey = this.normalizeDOI(doi);
-					let existingDOIs = existingDOICache.get(targetCollectionID);
-					if (!existingDOIs) {
-						existingDOIs = await this.getCollectionDOISet(targetCollectionID);
-						existingDOICache.set(targetCollectionID, existingDOIs);
-					}
-					if (existingDOIs.has(doiKey)) {
-						Zotero.debug(`ZotLink: skipped duplicate DOI in collection ${targetCollectionID}: ${doiKey}`);
-						skipped++;
-						this.countReason(reasons, "collection 中已存在 DOI");
-						continue;
-					}
+				}
 
-					let item = await this.createLinkedPDFItemFromDOI({
-						doi,
-						pdfPath,
-						collectionID: targetCollectionID,
-						index
+				let collectionPath = await this.getCollectionPathByIDAsync(collectionID);
+				if (!collectionPath.length) {
+					this.showSoftReport("无法解析当前 collection 的文件夹路径。");
+					return;
+				}
+
+				let folderPath = PathUtils.join(root, ...collectionPath);
+				if (!(await IOUtils.exists(folderPath))) {
+					this.showSoftReport(`Collection 对应文件夹不存在：${folderPath}`, 8000);
+					return;
+				}
+
+				let headline = recursive ? "正在递归导入分类文件夹 PDF" : "正在从当前分类文件夹导入 PDF";
+				let progressWindow = null;
+				let lastScanStatusAt = 0;
+				let lastSoftStatusAt = 0;
+				let recursiveStructure = null;
+				let subcollectionDiagnosticPath = "";
+				this.showSoftReport(`ZotLink - ${headline}：正在扫描文件夹...`, 5000);
+				if (recursive) {
+					this.updateProgressWindow(progressWindow, headline, "正在按磁盘子文件夹重建子分类结构...");
+					recursiveStructure = await this.ensureSubcollectionStructureFromFolder(folderPath, collectionID, {
+						onProgress: ({ directories, created }) => {
+							let now = Date.now();
+							if (directories === 1 || now - lastScanStatusAt >= 1200) {
+								lastScanStatusAt = now;
+								this.updateProgressWindow(progressWindow, headline, `正在确认子分类：已检查 ${directories || 0} 个文件夹，新增 ${created || 0} 个`);
+							}
+							if (directories === 1 || now - lastSoftStatusAt >= 5000) {
+								lastSoftStatusAt = now;
+								this.showSoftReport(`ZotLink - ${headline}：正在确认子分类，已检查 ${directories || 0} 个文件夹`, 4000);
+							}
+						}
 					});
-					if (item) {
-						existingDOIs.add(doiKey);
-						imported++;
+				if (this.shouldWriteSubcollectionDiagnostic(recursiveStructure)) {
+					subcollectionDiagnosticPath = await this.writeTextReport("zotlink-subcollection-diagnostic", recursiveStructure.diagnostics.join("\n"));
+				}
+					this.refreshCollectionsPane();
+					this.updateProgressWindow(progressWindow, headline, `子分类已确认：检查 ${recursiveStructure.directoryCount} 个文件夹，新增 ${recursiveStructure.created} 个，复用 ${recursiveStructure.reused || 0} 个；正在扫描 PDF...`);
+				}
+				let pdfEntries = recursive
+					? await this.getPDFImportEntriesRecursive(folderPath, collectionID, {
+						collectionCache: recursiveStructure?.collectionCache,
+						childCollectionCache: recursiveStructure?.childCollectionCache,
+						onProgress: ({ directories, pdfs, currentPath }) => {
+							let now = Date.now();
+							if (directories === 1 || now - lastScanStatusAt >= 1200) {
+								lastScanStatusAt = now;
+								this.updateProgressWindow(progressWindow, headline, `正在扫描第 ${directories || 0} 个文件夹，已找到 ${pdfs || 0} 个 PDF`);
+							}
+							if (directories === 1 || now - lastSoftStatusAt >= 5000) {
+								lastSoftStatusAt = now;
+								this.showSoftReport(`ZotLink - ${headline}：已找到 ${pdfs || 0} 个 PDF`, 4000);
+							}
+						}
+					})
+					: await this.getPDFImportEntriesShallow(folderPath, collectionID);
+				let pdfs = pdfEntries.map(entry => entry.path);
+				if (!pdfs.length) {
+					this.updateProgressWindow(progressWindow, "PDF 导入完成", "未找到 PDF", 4000);
+					this.closeProgressWindow(progressWindow);
+					this.showSoftReport(`未在文件夹中找到 PDF：${folderPath}`, 8000);
+					return;
+				}
+
+				let existingIdentifierCache = new Map();
+				let isbnDiagnostics = [];
+				let imported = 0;
+				let linkedExisting = 0;
+				let unchangedExisting = 0;
+				let skipped = 0;
+				let reasons = new Map();
+				let skippedReasons = new Map();
+				let importDiagnostics = [];
+				let index = this.getAttachmentFileIndex();
+				let fileIDItems = await this.getIndexedAttachmentItemMapByFileID(index);
+				let pdfFileIDs = await this.getWindowsFileIDsWithPython(pdfs);
+				this.updateProgressWindow(progressWindow, headline, `已扫描到 ${pdfs.length} 个 PDF；已处理 0 / ${pdfs.length}`);
+				this.showSoftReport(`ZotLink - ${headline}：已扫描到 ${pdfs.length} 个 PDF，开始导入...`, 5000);
+
+				for (let i = 0; i < pdfEntries.length; i++) {
+					let entry = pdfEntries[i];
+					let pdfPath = entry.path;
+					let targetCollectionID = entry.collectionID || collectionID;
+					try {
+						let fileIDLocator = pdfFileIDs.get(this.normalizePathForCompare(pdfPath));
+						let fileIDMatch = await this.findIndexedAttachmentItemByFileID(fileIDLocator?.fileID, fileIDItems);
+						if (fileIDMatch?.itemID) {
+							await this.refreshFileIDMatchedAttachmentPath(fileIDMatch.attachment, pdfPath, fileIDLocator.fileID, index);
+							let added = await this.addExistingItemToCollection(fileIDMatch.itemID, targetCollectionID);
+							let itemText = await this.formatImportItemDiagnostic(fileIDMatch.itemID);
+							let collectionText = await this.formatImportCollectionDiagnostic(targetCollectionID);
+							if (added) {
+								linkedExisting++;
+								this.countReason(reasons, "机内码命中已有附件，已加入目标分类");
+								this.addImportDiagnostic(importDiagnostics, `归入：机内码命中已有附件，已加入目标分类；条目=${itemText}；分类=${collectionText}；PDF=${pdfPath}`);
+							}
+							else {
+								unchangedExisting++;
+								this.countReason(reasons, "机内码命中已有附件，已在目标分类");
+								this.addImportDiagnostic(importDiagnostics, `已存在：机内码命中已有附件，已在目标分类；条目=${itemText}；分类=${collectionText}；PDF=${pdfPath}`);
+							}
+							continue;
+						}
+
+						let identifier = await this.extractIdentifierFromPDFMetadata(pdfPath);
+						if (!identifier.value) {
+							skipped++;
+							this.countReason(reasons, "未发现 DOI/ISBN");
+							this.countReason(skippedReasons, "未发现 DOI/ISBN");
+							let fileIDText = fileIDLocator?.fileID
+								? `机内码=${fileIDLocator.fileID}；机内码有效索引命中=否`
+								: "机内码=未读取到";
+							this.addImportDiagnostic(importDiagnostics, `跳过：未发现 DOI/ISBN；${fileIDText}；PDF=${pdfPath}`);
+							continue;
+						}
+						let identifierKeys = this.normalizeIdentifierValues(identifier);
+						let identifierKey = identifierKeys[0] || "";
+						let existingItems = existingIdentifierCache.get(identifier.type);
+						if (!existingItems) {
+							existingItems = await this.getLibraryIdentifierItemMap(identifier.type);
+							existingIdentifierCache.set(identifier.type, existingItems);
+						}
+						let existingItemID = identifierKeys.map(key => existingItems.get(key)).find(Boolean);
+						if (existingItemID) {
+							Zotero.debug(`ZotLink: skipped duplicate ${identifier.type.toUpperCase()} in library: ${identifierKey}`);
+							let result = await this.attachOrMirrorPDFForExistingItem({
+								itemID: existingItemID,
+								pdfPath,
+								collectionID: targetCollectionID,
+								index
+							});
+							let itemText = await this.formatImportItemDiagnostic(existingItemID);
+							let collectionText = await this.formatImportCollectionDiagnostic(targetCollectionID);
+							if (result.addedToCollection || result.attachmentCreated || result.mirrorSynced) {
+								linkedExisting++;
+								this.countReason(reasons, `库中已存在 ${identifier.type.toUpperCase()}，已同步附件/分类`);
+								this.addImportDiagnostic(importDiagnostics, `归入：库中已存在 ${identifier.type.toUpperCase()}，已同步附件/分类；条目=${itemText}；分类=${collectionText}；PDF=${pdfPath}`);
+							}
+							else {
+								unchangedExisting++;
+								this.countReason(reasons, `库中已存在 ${identifier.type.toUpperCase()}，已在目标分类`);
+								this.addImportDiagnostic(importDiagnostics, `已存在：库中已存在 ${identifier.type.toUpperCase()}，已在目标分类；条目=${itemText}；分类=${collectionText}；PDF=${pdfPath}`);
+							}
+							continue;
+						}
+						if (identifier.type === "isbn" && isbnDiagnostics.length < 5) {
+							isbnDiagnostics.push(await this.buildISBNDuplicateDiagnostic(pdfPath, identifier, identifierKeys, existingItems));
+						}
+
+						let item = await this.createLinkedPDFItemFromIdentifier({
+							identifier,
+							pdfPath,
+							collectionID: targetCollectionID,
+							index
+						});
+						if (item) {
+							for (let key of identifierKeys) {
+								if (key && !existingItems.has(key)) {
+									existingItems.set(key, item.id);
+								}
+							}
+							imported++;
+						}
+						else {
+							skipped++;
+							this.countReason(reasons, "创建条目失败");
+							this.countReason(skippedReasons, "创建条目失败");
+							this.addImportDiagnostic(importDiagnostics, `失败：创建条目返回空；${identifier.type.toUpperCase()}=${identifier.value}；PDF=${pdfPath}`);
+						}
 					}
-					else {
+					catch (e) {
+						Zotero.logError(e);
 						skipped++;
-						this.countReason(reasons, "创建条目失败");
+						this.countReason(reasons, e.message || "异常");
+						this.countReason(skippedReasons, e.message || "异常");
+						this.addImportDiagnostic(importDiagnostics, `异常：${this.errorToText(e) || e}；PDF=${pdfPath}`);
+					}
+
+					let processed = i + 1;
+					if (processed === 1 || processed === pdfs.length || processed % 5 === 0) {
+						this.updateProgressWindow(progressWindow, headline, `已处理 ${processed} / ${pdfs.length}，已导入 ${imported}，已归入 ${linkedExisting}，已存在 ${unchangedExisting}，跳过 ${skipped}`);
+						let now = Date.now();
+						if (processed === 1 || processed === pdfs.length || now - lastSoftStatusAt >= 5000) {
+							lastSoftStatusAt = now;
+							this.showSoftReport(`ZotLink - ${headline}：已处理 ${processed} / ${pdfs.length}`, 4000);
+						}
 					}
 				}
-				catch (e) {
-					Zotero.logError(e);
-					skipped++;
-					this.countReason(reasons, e.message || "异常");
-				}
 
-				let processed = i + 1;
-				if (processed === 1 || processed === pdfs.length || processed % 5 === 0) {
-					this.updateProgressWindow(progressWindow, headline, `已处理 ${processed} / ${pdfs.length}，已导入 ${imported}，跳过 ${skipped}`);
+				this.setAttachmentFileIndex(index);
+				let skippedReasonText = this.formatReasons(skippedReasons);
+				this.updateProgressWindow(progressWindow, "PDF 导入完成", `已导入 ${imported}，已归入 ${linkedExisting}，已存在 ${unchangedExisting}，跳过 ${skipped}`, 1200);
+				if (isbnDiagnostics.length) {
+					await this.writeTextReport("zotlink-isbn-diagnostic", isbnDiagnostics.join("\n\n---\n\n"));
 				}
+				if (importDiagnostics.length) {
+					await this.writeTextReport("zotlink-import-diagnostic", importDiagnostics.join("\n"));
+				}
+				let seconds = Math.round((Date.now() - startedAt) / 1000);
+				this.closeProgressWindow(progressWindow);
+				this.showCollectionImportCompletion(`${modeText}完成：共检查 ${pdfs.length} 个 PDF，已新建 ${imported} 个，已归入已有条目 ${linkedExisting} 个${unchangedExisting ? `，已存在无需处理 ${unchangedExisting} 个` : ""}${skipped ? `，跳过 ${skipped} 个${skippedReasonText ? "：" + skippedReasonText : ""}` : ""}。耗时约 ${seconds} 秒。`);
 			}
+			finally {
+				this._collectionPDFImportRunning = false;
+			}
+		},
 
-			this.setAttachmentFileIndex(index);
-			let reasonText = this.formatReasons(reasons);
-			this.updateProgressWindow(progressWindow, "PDF 导入完成", `已导入 ${imported}，跳过 ${skipped}`, 5000);
-			let modeText = recursive ? "递归导入 Collection 文件夹 PDF" : "导入当前 Collection 文件夹 PDF";
-			this.showSoftReport(`${modeText}完成：共检查 ${pdfs.length} 个 PDF，已导入 ${imported} 个${skipped ? `，跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。`, 8000);
+		showCollectionImportCompletion(message) {
+			let useAlert = this.getBoolPref("useAlertForCollectionImportCompletion", false);
+			if (useAlert) {
+				this.showAlert("ZotLink 导入完成", message);
+			}
+			else {
+				this.showSoftReport(`ZotLink 导入完成：${message}`, 9000);
+			}
+		},
+
+		addImportDiagnostic(lines, message) {
+			if (!Array.isArray(lines)) {
+				return;
+			}
+			if (lines.length < 1000) {
+				lines.push(message);
+			}
+		},
+
+		async formatImportItemDiagnostic(itemID) {
+			let id = Number(itemID) || 0;
+			let item = null;
+			try {
+				item = id ? await Zotero.Items.getAsync(id) : null;
+			}
+			catch (e) {
+				Zotero.logError(e);
+			}
+			let title = this.getItemDisplayName(item) || "未知条目";
+			let year = "";
+			try {
+				year = String(item?.getField?.("year") || item?.getField?.("date") || "").trim();
+			}
+			catch (e) {
+				year = "";
+			}
+			let key = item?.key ? `；key=${item.key}` : "";
+			let yearText = year ? `；年份=${year}` : "";
+			return `${title}${yearText}${key}；itemID=${id || itemID}`;
+		},
+
+		async formatImportCollectionDiagnostic(collectionID) {
+			let id = Number(collectionID) || 0;
+			let path = [];
+			try {
+				path = id ? await this.getCollectionPathByIDAsync(id) : [];
+			}
+			catch (e) {
+				Zotero.logError(e);
+			}
+			return `${path.length ? path.join("/") : "未知分类"}；collectionID=${id || collectionID}`;
+		},
+
+		shouldWriteSubcollectionDiagnostic(structure) {
+			if (!structure?.diagnostics?.length || !structure?.writeDiagnostic) {
+				return false;
+			}
+			return structure.diagnostics.some(line => /失败|异常|无法/.test(String(line || "")));
 		},
 
 		async importPDFsFromAttachmentRootFolder(options = {}) {
@@ -1769,6 +3179,7 @@
 				this.showSoftReport(`附件顶层路径不存在：${root}`, 8000);
 				return;
 			}
+			await this.repairAllLibraryAttachmentLinksByFileID({ silent: true });
 
 			let headline = "正在从顶层文件夹重建链接库";
 			let useProgressWindow = options.useProgressWindow !== false;
@@ -1836,12 +3247,15 @@
 
 			notifyProgress(
 				headline,
-				`已找到 ${pdfEntries.length} 个 PDF；正在读取库中已有 DOI`,
-				"读取已有 DOI...",
+				`已找到 ${pdfEntries.length} 个 PDF；正在读取库中已有 DOI/ISBN`,
+				"读取已有标识符...",
 				3000,
 				true
 			);
-			let existingDOIs = await this.getLibraryDOISet();
+			let existingLibraryIdentifiers = {
+				doi: await this.getLibraryIdentifierSet("doi"),
+				isbn: await this.getLibraryIdentifierSet("isbn")
+			};
 			let imported = 0;
 			let skipped = 0;
 			let reasons = new Map();
@@ -1858,27 +3272,28 @@
 			for (let i = 0; i < pdfEntries.length; i++) {
 				let entry = pdfEntries[i];
 				try {
-					let doi = await this.extractDOIFromPDFMetadata(entry.path);
-					if (!doi) {
+					let identifier = await this.extractIdentifierFromPDFMetadata(entry.path);
+					if (!identifier.value) {
 						skipped++;
-						this.countReason(reasons, "未发现 DOI");
+						this.countReason(reasons, "未发现 DOI/ISBN");
 						continue;
 					}
-					let doiKey = this.normalizeDOI(doi);
-					if (existingDOIs.has(doiKey)) {
+					let identifierKey = this.normalizeIdentifierValue(identifier);
+					let existingIdentifiers = existingLibraryIdentifiers[identifier.type] || new Set();
+					if (existingIdentifiers.has(identifierKey)) {
 						skipped++;
-						this.countReason(reasons, "库中已存在 DOI");
+						this.countReason(reasons, `库中已存在 ${identifier.type.toUpperCase()}`);
 						continue;
 					}
 
-					let item = await this.createLinkedPDFItemFromDOI({
-						doi,
+					let item = await this.createLinkedPDFItemFromIdentifier({
+						identifier,
 						pdfPath: entry.path,
 						collectionID: entry.collectionID,
 						index
 					});
 					if (item) {
-						existingDOIs.add(doiKey);
+						existingIdentifiers.add(identifierKey);
 						imported++;
 					}
 					else {
@@ -2118,7 +3533,7 @@
 			for (let child of children) {
 				try {
 					let stat = await IOUtils.stat(child);
-					if (stat.type === "regular" && /\.pdf$/i.test(child)) {
+					if (this.isRegularFileStat(stat) && /\.pdf$/i.test(child)) {
 						entries.push({
 							path: child,
 							collectionID
@@ -2132,18 +3547,29 @@
 			return entries;
 		},
 
-		async getPDFImportEntriesRecursive(folderPath, collectionID) {
+		async getPDFImportEntriesRecursive(folderPath, collectionID, options = {}) {
 			let entries = [];
-			let collectionCache = new Map();
-			collectionCache.set("", collectionID);
-			let childCollectionCache = new Map();
+			let directoryCount = 0;
+			let collectionCache = options.collectionCache || new Map();
+			if (!collectionCache.has("")) {
+				collectionCache.set("", collectionID);
+			}
+			let childCollectionCache = options.childCollectionCache || new Map();
 			let stack = [{
 				dir: folderPath,
 				relativeSegments: []
 			}];
 			while (stack.length) {
 				let current = stack.pop();
+				directoryCount++;
 				let currentCollectionID = await this.ensureCollectionPath(collectionID, current.relativeSegments, collectionCache, childCollectionCache);
+				if (directoryCount === 1 || directoryCount % 5 === 0) {
+					options.onProgress?.({
+						directories: directoryCount,
+						pdfs: entries.length,
+						currentPath: current.dir
+					});
+				}
 				let children;
 				try {
 					children = await IOUtils.getChildren(current.dir);
@@ -2154,32 +3580,216 @@
 				}
 
 				for (let child of children) {
-					let stat;
+					let stat = null;
 					try {
 						stat = await IOUtils.stat(child);
 					}
 					catch (e) {
 						Zotero.logError(e);
-						continue;
 					}
-					if (stat.type === "directory") {
+					let isDirectory = await this.isDirectoryPath(child, stat);
+					if (isDirectory) {
 						stack.push({
 							dir: child,
 							relativeSegments: current.relativeSegments.concat([PathUtils.filename(child)])
 						});
 					}
-					else if (stat.type === "regular" && /\.pdf$/i.test(child)) {
+					else if ((this.isRegularFileStat(stat) || !stat) && /\.pdf$/i.test(child)) {
 						entries.push({
 							path: child,
 							collectionID: currentCollectionID
 						});
+						if (entries.length === 1 || entries.length % 25 === 0) {
+							options.onProgress?.({
+								directories: directoryCount,
+								pdfs: entries.length,
+								currentPath: current.dir
+							});
+						}
 					}
 				}
 			}
+			options.onProgress?.({
+				directories: directoryCount,
+				pdfs: entries.length,
+				currentPath: folderPath
+			});
 			return entries;
 		},
 
-		async ensureCollectionPath(rootCollectionID, relativeSegments, cache = new Map(), childCache = new Map()) {
+		async ensureSubcollectionStructureFromFolder(folderPath, collectionID, options = {}) {
+			let collectionCache = new Map();
+			collectionCache.set("", collectionID);
+			let childCollectionCache = new Map();
+			let stats = { checked: 0, created: 0, reused: 0, diagnostics: [], forceCreateSubcollections: false, writeDiagnostic: false };
+			this.addSubcollectionDiagnostic(stats, `开始：rootCollectionID=${collectionID}；folder=${folderPath}`);
+			let directoryCount = 0;
+			let stack = [{
+				dir: folderPath,
+				relativeSegments: []
+			}];
+			while (stack.length) {
+				let current = stack.pop();
+				directoryCount++;
+				await this.ensureCollectionPath(collectionID, current.relativeSegments, collectionCache, childCollectionCache, stats);
+				if (directoryCount === 1 || directoryCount % 5 === 0) {
+					options.onProgress?.({
+						directories: directoryCount,
+						checked: stats.checked,
+						created: stats.created,
+						currentPath: current.dir
+					});
+				}
+				let children;
+				try {
+					children = await IOUtils.getChildren(current.dir);
+					this.addSubcollectionDiagnostic(stats, `扫描目录：relative=${current.relativeSegments.join("/") || "."}；path=${current.dir}；children=${children.length}`);
+				}
+				catch (e) {
+					Zotero.logError(e);
+					this.addSubcollectionDiagnostic(stats, `失败：无法读取目录；relative=${current.relativeSegments.join("/") || "."}；path=${current.dir}；error=${this.errorToText(e) || e}`);
+					continue;
+				}
+				for (let child of children) {
+					let stat = null;
+					try {
+						stat = await IOUtils.stat(child);
+					}
+					catch (e) {
+						Zotero.logError(e);
+						this.addSubcollectionDiagnostic(stats, `提示：stat 失败，继续尝试目录读取；path=${child}；error=${this.errorToText(e) || e}`);
+					}
+					if (await this.isDirectoryPath(child, stat)) {
+						this.addSubcollectionDiagnostic(stats, `发现子文件夹：parentRelative=${current.relativeSegments.join("/") || "."}；name=${PathUtils.filename(child)}；path=${child}`);
+						stack.push({
+							dir: child,
+							relativeSegments: current.relativeSegments.concat([PathUtils.filename(child)])
+						});
+					}
+					else if (!stat && !/\.[^\\/]+$/i.test(PathUtils.filename(child))) {
+						stats.diagnostics?.push?.(`跳过：无法确认是否为文件夹；path=${child}`);
+					}
+				}
+			}
+			options.onProgress?.({
+				directories: directoryCount,
+				checked: stats.checked,
+				created: stats.created,
+				currentPath: folderPath
+			});
+			return {
+				directoryCount,
+				checked: stats.checked,
+				created: stats.created,
+				reused: stats.reused,
+				diagnostics: stats.diagnostics,
+				writeDiagnostic: Boolean(stats.writeDiagnostic || stats.diagnostics.length),
+				collectionCache,
+				childCollectionCache
+			};
+		},
+
+		addSubcollectionDiagnostic(stats, message) {
+			if (!stats?.diagnostics) {
+				return;
+			}
+			if (stats.diagnostics.length < 800) {
+				stats.diagnostics.push(message);
+			}
+		},
+
+		refreshCollectionsPane() {
+			try {
+				let pane = Zotero.getActiveZoteroPane?.();
+				pane?.collectionsView?.refresh?.();
+				pane?.collectionsView?.invalidate?.();
+			}
+			catch (e) {
+				Zotero.logError(e);
+			}
+		},
+
+		refreshZoteroUIAfterImport() {
+			try {
+				let win = Zotero.getMainWindow?.();
+				let pane = Zotero.getActiveZoteroPane?.();
+				pane?.collectionsView?.refresh?.();
+				pane?.collectionsView?.invalidate?.();
+				pane?.itemsView?.refreshAndMaintainSelection?.();
+				win?.focus?.();
+			}
+			catch (e) {
+				Zotero.logError(e);
+			}
+		},
+
+		isDirectoryStat(stat) {
+			return Boolean(stat && (stat.type === "directory" || stat.type === "dir" || stat.isDirectory === true));
+		},
+
+		isRegularFileStat(stat) {
+			return Boolean(stat && (stat.type === "regular" || stat.type === "file" || stat.isFile === true));
+		},
+
+		async isDirectoryPath(path, stat = null) {
+			if (this.isDirectoryStat(stat)) {
+				return true;
+			}
+			try {
+				await IOUtils.getChildren(path);
+				return true;
+			}
+			catch (e) {
+				return this.isDirectoryPathWithPython(path);
+			}
+		},
+
+		async isDirectoryPathWithPython(path) {
+			let scriptPath = this.getTempTextPath("zotlink-isdir").replace(/\.txt$/i, ".py");
+			let outputPath = this.getTempTextPath("zotlink-isdir-output");
+			let script = [
+				"import os, sys",
+				"path, output = sys.argv[1], sys.argv[2]",
+				"with open(output, 'w', encoding='utf-8') as f:",
+				"    f.write('1' if os.path.isdir(path) else '0')"
+			].join("\n");
+			try {
+				await IOUtils.write(scriptPath, new TextEncoder().encode(script));
+				for (let command of ["C:\\Windows\\pyw.exe", "C:\\Windows\\py.exe"]) {
+					let result = await this.execDiagnosticCommand(command, [
+						"-3",
+						scriptPath,
+						path,
+						outputPath
+					], outputPath);
+					let text = String(result.text || "").trim();
+					if (text === "1") {
+						return true;
+					}
+					if (text === "0") {
+						return false;
+					}
+				}
+			}
+			catch (e) {
+				Zotero.logError(e);
+			}
+			finally {
+				for (let tempPath of [scriptPath, outputPath]) {
+					try {
+						if (await IOUtils.exists(tempPath)) {
+							await IOUtils.remove(tempPath);
+						}
+					}
+					catch (e) {
+						Zotero.logError(e);
+					}
+				}
+			}
+			return false;
+		},
+
+		async ensureCollectionPath(rootCollectionID, relativeSegments, cache = new Map(), childCache = new Map(), stats = null) {
 			let key = (relativeSegments || []).join("\u001f");
 			if (cache.has(key)) {
 				return cache.get(key);
@@ -2193,19 +3803,19 @@
 					continue;
 				}
 				accumulated.push(name);
-				let childKey = `${parentID || "root"}\u001f${accumulated.join("\u001f")}`;
+				let childKey = `${parentID || "root"}\u001f${this.normalizeCollectionNameForMatch(name)}`;
 				if (cache.has(childKey)) {
 					parentID = cache.get(childKey);
 					continue;
 				}
-				parentID = await this.ensureChildCollection(parentID, name, childCache);
+				parentID = await this.ensureChildCollection(parentID, name, childCache, stats);
 				cache.set(childKey, parentID);
 			}
 			cache.set(key, parentID);
 			return parentID;
 		},
 
-		async ensureChildCollection(parentID, name, cache = new Map()) {
+		async ensureChildCollection(parentID, name, cache = new Map(), stats = null) {
 			parentID = parentID ? Number(parentID) : null;
 			let normalizedName = this.normalizeCollectionNameForMatch(name);
 			let cacheKey = `${parentID || "root"}\u001f${normalizedName}`;
@@ -2215,10 +3825,20 @@
 
 			let parent = parentID ? Zotero.Collections.get(parentID) : null;
 			let libraryID = parent?.libraryID || Zotero.Libraries.userLibraryID;
-			let child = await this.findChildCollectionByName(parentID, name);
-			if (child) {
-				cache.set(cacheKey, child.id);
-				return child.id;
+			if (stats) {
+				stats.checked = Number(stats.checked || 0) + 1;
+			}
+			if (!stats?.forceCreateSubcollections) {
+				let child = await this.findChildCollectionByName(parentID, name, stats);
+				if (child) {
+					this.addSubcollectionDiagnostic(stats, `复用：parent=${parentID || "root"}；name=${name}；id=${child.id}`);
+					if (stats) {
+						stats.reused = Number(stats.reused || 0) + 1;
+						stats.writeDiagnostic = true;
+					}
+					cache.set(cacheKey, child.id);
+					return child.id;
+				}
 			}
 
 			let collection = new Zotero.Collection();
@@ -2226,46 +3846,160 @@
 			collection.name = name;
 			if (parentID) {
 				collection.parentID = parentID;
+				if (parent?.key) {
+					collection.parentKey = parent.key;
+				}
+				collection.parentCollectionID = parentID;
 			}
-			let collectionID = await collection.saveTx();
+			let savedID = await collection.saveTx();
+			let collectionID = Number(savedID || collection.id) || 0;
+			if (!collectionID) {
+				let saved = await this.findChildCollectionByName(parentID, name, stats);
+				collectionID = Number(saved?.id) || 0;
+			}
+			if (!collectionID) {
+				this.addSubcollectionDiagnostic(stats, `失败：parent=${parentID || "root"}；name=${name}；saveTx=${savedID || ""}`);
+				throw new Error(`无法创建 subcollection：${name}`);
+			}
+			if (stats) {
+				stats.created = Number(stats.created || 0) + 1;
+				stats.writeDiagnostic = true;
+				this.addSubcollectionDiagnostic(stats, `新建：parent=${parentID || "root"}；name=${name}；id=${collectionID}`);
+			}
 			cache.set(cacheKey, collectionID);
 			return collectionID;
 		},
 
-		async findChildCollectionByName(parentID, name) {
+		async findChildCollectionByName(parentID, name, stats = null) {
 			parentID = parentID ? Number(parentID) : null;
 			let target = this.normalizeCollectionNameForMatch(name);
-			let collections = Zotero.Collections.getByLibrary
-				? Zotero.Collections.getByLibrary(Zotero.Libraries.userLibraryID)
-				: [];
-			for (let collection of collections || []) {
-				let collectionParentID = collection.parentID ? Number(collection.parentID) : null;
-				if (collectionParentID !== parentID) {
-					continue;
-				}
-				if (this.normalizeCollectionNameForMatch(collection.name) === target) {
-					return collection;
-				}
-			}
-			let rows = await Zotero.DB.queryAsync(
-				"SELECT collectionID, collectionName, parentCollectionID FROM collections WHERE libraryID=?",
-				[Zotero.Libraries.userLibraryID]
-			);
+			let sql = parentID
+				? "SELECT collectionID AS id, collectionName AS name, parentCollectionID AS parentID FROM collections WHERE libraryID=? AND parentCollectionID=?"
+				: "SELECT collectionID AS id, collectionName AS name, parentCollectionID AS parentID FROM collections WHERE libraryID=? AND parentCollectionID IS NULL";
+			let params = parentID
+				? [Zotero.Libraries.userLibraryID, parentID]
+				: [Zotero.Libraries.userLibraryID];
+			let rows = await Zotero.DB.queryAsync(sql, params);
 			for (let row of rows || []) {
-				let collectionParentID = row.parentCollectionID || row.parentcollectionid || row.parentCollectionId || row[2] || null;
-				collectionParentID = collectionParentID ? Number(collectionParentID) : null;
-				if (collectionParentID !== parentID) {
-					continue;
-				}
-				let collectionName = row.collectionName || row.collectionname || row[1] || "";
+				let collectionName = row.name || row.NAME || row.collectionName || row.collectionname || row[1] || "";
 				if (this.normalizeCollectionNameForMatch(collectionName) !== target) {
 					continue;
 				}
-				let collectionID = row.collectionID || row.collectionid || row[0];
+				let collectionID = row.id || row.ID || row.collectionID || row.collectionid || row[0];
+				if (await this.isDeletedCollectionID(collectionID)) {
+					this.addSubcollectionDiagnostic(stats, `跳过回收站 collection：parent=${parentID || "root"}；name=${collectionName}；id=${collectionID}`);
+					if (stats) {
+						stats.writeDiagnostic = true;
+					}
+					continue;
+				}
 				let collection = collectionID ? Zotero.Collections.get(Number(collectionID)) : null;
-				return collection || { id: Number(collectionID), name: collectionName, parentID: collectionParentID };
+				return collection || { id: Number(collectionID), name: collectionName, parentID };
 			}
 			return null;
+		},
+
+		async isDeletedCollectionID(collectionID) {
+			collectionID = Number(collectionID) || 0;
+			if (!collectionID) {
+				return false;
+			}
+			try {
+				let collection = Zotero.Collections.get(collectionID);
+				if (collection?.deleted || collection?.isDeleted || collection?.inTrash) {
+					return true;
+				}
+			}
+			catch (e) {
+				Zotero.logError(e);
+			}
+			try {
+				if (this._hasDeletedCollectionsTable === undefined) {
+					let tables = await Zotero.DB.queryAsync(
+						"SELECT name FROM sqlite_master WHERE type='table' AND name='deletedCollections'"
+					);
+					this._hasDeletedCollectionsTable = Boolean(tables?.length);
+				}
+				if (!this._hasDeletedCollectionsTable) {
+					return false;
+				}
+				let rows = await Zotero.DB.queryAsync(
+					"SELECT collectionID FROM deletedCollections WHERE collectionID=? LIMIT 1",
+					[collectionID]
+				);
+				return Boolean(rows?.length);
+			}
+			catch (e) {
+				Zotero.logError(e);
+				return false;
+			}
+		},
+
+		async isDeletedItemID(itemID) {
+			itemID = Number(itemID) || 0;
+			if (!itemID) {
+				return false;
+			}
+			try {
+				let item = await Zotero.Items.getAsync(itemID);
+				if (item?.deleted || item?.isDeleted || item?.inTrash) {
+					return true;
+				}
+			}
+			catch (e) {
+				Zotero.logError(e);
+			}
+			try {
+				let rows = await Zotero.DB.queryAsync(
+					"SELECT itemID FROM deletedItems WHERE itemID=? LIMIT 1",
+					[itemID]
+				);
+				return Boolean(rows?.length);
+			}
+			catch (e) {
+				Zotero.logError(e);
+				return false;
+			}
+		},
+
+		async getCollectionParentID(collection) {
+			if (!collection) {
+				return null;
+			}
+			let objectParentID = this.getCollectionParentIDValue(collection);
+			if (objectParentID) {
+				return objectParentID;
+			}
+			if (collection.parentKey && Zotero.Collections.getByLibraryAndKey) {
+				let parent = Zotero.Collections.getByLibraryAndKey(collection.libraryID || Zotero.Libraries.userLibraryID, collection.parentKey);
+				if (parent?.id) {
+					return Number(parent.id);
+				}
+			}
+			if (collection.id) {
+				try {
+					let rows = await Zotero.DB.queryAsync(
+						"SELECT parentCollectionID FROM collections WHERE collectionID=?",
+						[Number(collection.id)]
+					);
+					let row = rows?.[0];
+					let parentID = row?.parentCollectionID || row?.parentcollectionid || row?.[0] || null;
+					return parentID ? Number(parentID) : null;
+				}
+				catch (e) {
+					Zotero.logError(e);
+				}
+			}
+			return null;
+		},
+
+		getCollectionParentIDValue(collection) {
+			if (!collection) {
+				return null;
+			}
+			let parentID = collection.parentID || collection.parentCollectionID || null;
+			parentID = Number(parentID);
+			return Number.isInteger(parentID) && parentID > 0 ? parentID : null;
 		},
 
 		normalizeCollectionNameForMatch(name) {
@@ -2333,43 +4067,312 @@
 		},
 
 		async getCollectionDOISet(collectionID) {
-			let dois = new Set();
-			let rows = await Zotero.DB.queryAsync(
-				"SELECT IDV.value FROM collectionItems CI JOIN items I ON CI.itemID=I.itemID JOIN itemData ID ON I.itemID=ID.itemID JOIN fields F ON ID.fieldID=F.fieldID JOIN itemDataValues IDV ON ID.valueID=IDV.valueID LEFT JOIN deletedItems DI ON CI.itemID=DI.itemID WHERE CI.collectionID=? AND I.libraryID=? AND DI.itemID IS NULL AND F.fieldName='DOI'",
-				[collectionID, Zotero.Libraries.userLibraryID]
-			);
-			for (let row of rows) {
-				try {
-					let doi = row.value || row[0];
-					if (doi) {
-						dois.add(this.normalizeDOI(doi));
-					}
-				}
-				catch (e) {
-					Zotero.logError(e);
-				}
-			}
-			return dois;
+			return this.getCollectionIdentifierSet(collectionID, "doi");
 		},
 
 		async getLibraryDOISet() {
-			let dois = new Set();
+			return this.getLibraryIdentifierSet("doi");
+		},
+
+		async getCollectionIdentifierSet(collectionID, type) {
+			let values = new Set();
+			let fieldName = this.getIdentifierFieldName(type);
+			if (!fieldName) {
+				return values;
+			}
 			let rows = await Zotero.DB.queryAsync(
-				"SELECT IDV.value FROM items I JOIN itemData ID ON I.itemID=ID.itemID JOIN fields F ON ID.fieldID=F.fieldID JOIN itemDataValues IDV ON ID.valueID=IDV.valueID LEFT JOIN deletedItems DI ON I.itemID=DI.itemID WHERE I.libraryID=? AND DI.itemID IS NULL AND F.fieldName='DOI'",
-				[Zotero.Libraries.userLibraryID]
+				"SELECT IDV.value AS fieldValue FROM collectionItems CI JOIN items I ON CI.itemID=I.itemID JOIN itemData ID ON I.itemID=ID.itemID JOIN fields F ON ID.fieldID=F.fieldID JOIN itemDataValues IDV ON ID.valueID=IDV.valueID LEFT JOIN deletedItems DI ON CI.itemID=DI.itemID WHERE CI.collectionID=? AND I.libraryID=? AND DI.itemID IS NULL AND F.fieldName=?",
+				[collectionID, Zotero.Libraries.userLibraryID, fieldName]
 			);
 			for (let row of rows) {
 				try {
-					let doi = row.value || row[0];
-					if (doi) {
-						dois.add(this.normalizeDOI(doi));
+					let value = row.fieldValue || row.value || row[0];
+					for (let normalized of this.normalizeIdentifierValues({ type, value })) {
+						values.add(normalized);
 					}
 				}
 				catch (e) {
 					Zotero.logError(e);
 				}
 			}
-			return dois;
+			return values;
+		},
+
+		async getLibraryIdentifierSet(type) {
+			let values = new Set();
+			let map = await this.getLibraryIdentifierItemMap(type);
+			for (let value of map.keys()) {
+				values.add(value);
+			}
+			return values;
+		},
+
+		async getIndexedAttachmentItemMapByFileID(index = null) {
+			index = index || this.getAttachmentFileIndex();
+			let map = new Map();
+			for (let record of Object.values(index || {})) {
+				if (!record?.fileID) {
+					continue;
+				}
+				try {
+					let attachment = await this.getIndexedAttachment(record);
+					if (!attachment?.isFileAttachment?.()) {
+						continue;
+					}
+					let parent = attachment.parentItem;
+					if (!parent?.isRegularItem?.()) {
+						continue;
+					}
+					if (await this.isDeletedItemID(attachment.id) || await this.isDeletedItemID(parent.id)) {
+						continue;
+					}
+					for (let key of this.getFileIDLookupKeys(record.fileID)) {
+						if (key && !map.has(key)) {
+							map.set(key, { attachment, itemID: parent.id });
+						}
+					}
+				}
+				catch (e) {
+					Zotero.logError(e);
+				}
+			}
+			return map;
+		},
+
+		async findIndexedAttachmentItemByFileID(fileID, fileIDItems) {
+			if (!fileID || !fileIDItems?.size) {
+				return null;
+			}
+			for (let key of this.getFileIDLookupKeys(fileID)) {
+				let match = fileIDItems.get(key);
+				if (match?.attachment?.isFileAttachment?.()
+					&& match.itemID
+					&& !(await this.isDeletedItemID(match.attachment.id))
+					&& !(await this.isDeletedItemID(match.itemID))) {
+					return match;
+				}
+			}
+			return null;
+		},
+
+		async refreshFileIDMatchedAttachmentPath(attachment, pdfPath, fileID, index) {
+			if (!attachment?.isFileAttachment?.() || !pdfPath || !fileID) {
+				return false;
+			}
+			let currentPath = attachment.getFilePath?.() || "";
+			if (currentPath && await IOUtils.exists(currentPath)) {
+				return false;
+			}
+			await this.updateAttachmentLinkedPath(attachment, pdfPath);
+			this.recordAttachmentFileID(attachment, pdfPath, fileID, {
+				index,
+				save: false
+			});
+			return true;
+		},
+
+		async getLibraryIdentifierItemMap(type) {
+			let values = new Map();
+			let fieldName = this.getIdentifierFieldName(type);
+			if (!fieldName) {
+				return values;
+			}
+			let rows = await Zotero.DB.queryAsync(
+				"SELECT I.itemID AS itemID, IDV.value AS fieldValue FROM items I JOIN itemData ID ON I.itemID=ID.itemID JOIN fields F ON ID.fieldID=F.fieldID JOIN itemDataValues IDV ON ID.valueID=IDV.valueID LEFT JOIN deletedItems DI ON I.itemID=DI.itemID WHERE I.libraryID=? AND DI.itemID IS NULL AND F.fieldName=?",
+				[Zotero.Libraries.userLibraryID, fieldName]
+			);
+			for (let row of rows) {
+				try {
+					let value = row.fieldValue || row.value || row[1] || "";
+					let itemID = Number(row.itemID || row[0]);
+					for (let normalized of this.normalizeIdentifierValues({ type, value })) {
+						if (normalized && itemID && !values.has(normalized)) {
+							values.set(normalized, itemID);
+						}
+					}
+				}
+				catch (e) {
+					Zotero.logError(e);
+				}
+			}
+			return values;
+		},
+
+		async buildISBNDuplicateDiagnostic(pdfPath, identifier, identifierKeys, existingItems) {
+			let lines = [
+				"ZotLink ISBN 查重诊断",
+				`PDF：${pdfPath}`,
+				`PDF metadata ISBN：${identifier.value}`,
+				`PDF ISBN keys：${identifierKeys.join(" | ") || "(none)"}`,
+				`当前库 ISBN key 数：${existingItems?.size || 0}`,
+				"",
+				"当前库前 120 条 ISBN 字段："
+			];
+			try {
+				let rows = await Zotero.DB.queryAsync(
+					"SELECT I.itemID AS itemID, IDV.value AS fieldValue FROM items I JOIN itemData ID ON I.itemID=ID.itemID JOIN fields F ON ID.fieldID=F.fieldID JOIN itemDataValues IDV ON ID.valueID=IDV.valueID LEFT JOIN deletedItems DI ON I.itemID=DI.itemID WHERE I.libraryID=? AND DI.itemID IS NULL AND F.fieldName='ISBN' ORDER BY I.itemID LIMIT 120",
+					[Zotero.Libraries.userLibraryID]
+				);
+				for (let row of rows) {
+					let itemID = Number(row.itemID || row[0]);
+					let value = row.fieldValue || row.value || row[1] || "";
+					let keys = this.normalizeISBNValues(value);
+					lines.push(`itemID=${itemID}；raw=${String(value).replace(/\r?\n/g, " / ")}；keys=${keys.join(" | ") || "(none)"}`);
+				}
+			}
+			catch (e) {
+				lines.push(`读取当前库 ISBN 字段失败：${this.errorToText(e) || e}`);
+			}
+			return lines.join("\n");
+		},
+
+		async addExistingItemToCollection(itemID, collectionID) {
+			if (!itemID || !collectionID) {
+				return false;
+			}
+			itemID = Number(itemID);
+			collectionID = Number(collectionID);
+			let alreadyInCollection = await this.itemIsInCollection(itemID, collectionID);
+			let item = await Zotero.Items.getAsync(Number(itemID));
+			if (!item?.isRegularItem?.()) {
+				return false;
+			}
+
+			let collection = Zotero.Collections.get(collectionID);
+			if (alreadyInCollection && collection && typeof collection.addItem === "function") {
+				await Zotero.DB.queryAsync(
+					"DELETE FROM collectionItems WHERE collectionID=? AND itemID=?",
+					[collectionID, itemID]
+				);
+				alreadyInCollection = false;
+			}
+			if (collection && typeof collection.addItem === "function") {
+				collection.addItem(itemID);
+				await collection.saveTx();
+			}
+			else {
+				let collections = new Set((item.getCollections?.() || []).map(Number));
+				collections.add(collectionID);
+				if (typeof item.addToCollection === "function") {
+					item.addToCollection(collectionID);
+				}
+				else if (typeof item.setCollections === "function") {
+					item.setCollections(Array.from(collections));
+				}
+				else {
+					await Zotero.DB.queryAsync(
+						"INSERT OR IGNORE INTO collectionItems (collectionID, itemID) VALUES (?, ?)",
+						[collectionID, item.id]
+					);
+				}
+				if (typeof item.saveTx === "function") {
+					await item.saveTx();
+				}
+			}
+
+			if (!(await this.itemIsInCollection(itemID, collectionID))) {
+				await Zotero.DB.queryAsync(
+					"INSERT OR IGNORE INTO collectionItems (collectionID, itemID) VALUES (?, ?)",
+					[collectionID, itemID]
+				);
+			}
+			await this.cleanupDeletedSiblingCollectionMemberships(itemID, collectionID);
+			return !alreadyInCollection;
+		},
+
+		async cleanupDeletedSiblingCollectionMemberships(itemID, collectionID) {
+			itemID = Number(itemID) || 0;
+			collectionID = Number(collectionID) || 0;
+			if (!itemID || !collectionID) {
+				return 0;
+			}
+			try {
+				let rows = await Zotero.DB.queryAsync(
+					"SELECT collectionName, parentCollectionID FROM collections WHERE collectionID=?",
+					[collectionID]
+				);
+				let row = rows?.[0];
+				let collectionName = row?.collectionName || row?.collectionname || row?.[0] || "";
+				let parentID = row?.parentCollectionID || row?.parentcollectionid || row?.[1] || null;
+				if (!collectionName) {
+					return 0;
+				}
+				let params;
+				let sql;
+				if (parentID) {
+					sql = "SELECT C.collectionID AS collectionID FROM collections C JOIN deletedCollections DC ON C.collectionID=DC.collectionID WHERE C.collectionID<>? AND C.collectionName=? AND C.parentCollectionID=?";
+					params = [collectionID, collectionName, Number(parentID)];
+				}
+				else {
+					sql = "SELECT C.collectionID AS collectionID FROM collections C JOIN deletedCollections DC ON C.collectionID=DC.collectionID WHERE C.collectionID<>? AND C.collectionName=? AND C.parentCollectionID IS NULL";
+					params = [collectionID, collectionName];
+				}
+				let deletedRows = await Zotero.DB.queryAsync(sql, params);
+				let deletedIDs = (deletedRows || [])
+					.map(row => Number(row.collectionID || row.collectionid || row[0]))
+					.filter(Boolean);
+				let removed = 0;
+				for (let deletedID of deletedIDs) {
+					await Zotero.DB.queryAsync(
+						"DELETE FROM collectionItems WHERE collectionID=? AND itemID=?",
+						[deletedID, itemID]
+					);
+					removed++;
+				}
+				return removed;
+			}
+			catch (e) {
+				Zotero.logError(e);
+				return 0;
+			}
+		},
+
+		async itemIsInCollection(itemID, collectionID) {
+			itemID = Number(itemID) || 0;
+			collectionID = Number(collectionID) || 0;
+			if (!itemID || !collectionID) {
+				return false;
+			}
+			try {
+				let rows = await Zotero.DB.queryAsync(
+					"SELECT itemID FROM collectionItems WHERE collectionID=? AND itemID=? LIMIT 1",
+					[collectionID, itemID]
+				);
+				return Boolean(rows?.length);
+			}
+			catch (e) {
+				Zotero.logError(e);
+				return false;
+			}
+		},
+
+		async attachOrMirrorPDFForExistingItem({ itemID, pdfPath, collectionID, index }) {
+			let addedToCollection = await this.addExistingItemToCollection(itemID, collectionID);
+			let item = await Zotero.Items.getAsync(Number(itemID));
+			if (!item?.isRegularItem?.()) {
+				return { addedToCollection, attachmentCreated: false, mirrorSynced: false };
+			}
+			let attachment = await this.getPrimaryPDFAttachmentForItem(item);
+			if (!attachment) {
+				attachment = await this.createLinkedPDFAttachmentForItem(item, pdfPath, index, { firstImport: false });
+				return { addedToCollection, attachmentCreated: true, mirrorSynced: false };
+			}
+			let result = await this.syncAttachmentMirrors(attachment, {
+				index,
+				save: false,
+				preferredCollectionID: collectionID
+			});
+			return { addedToCollection, attachmentCreated: false, mirrorSynced: Boolean(result?.changed || result?.shortcutPathCount) };
+		},
+
+		getIdentifierFieldName(type) {
+			if (type === "doi") {
+				return "DOI";
+			}
+			if (type === "isbn") {
+				return "ISBN";
+			}
+			return "";
 		},
 
 		normalizeDOI(doi) {
@@ -2391,45 +4394,206 @@
 			return value.toLowerCase();
 		},
 
+		normalizeISBN(isbn) {
+			return this.normalizeISBNValues(isbn)[0] || "";
+		},
+
+		normalizeISBNValues(isbnText) {
+			let text = String(isbnText || "").toUpperCase();
+			let candidates = [];
+			let addCandidate = candidate => {
+				if (candidate) {
+					candidates.push(candidate);
+				}
+			};
+			for (let pattern of [
+				/ISBN(?:-1[03])?:?\s*((?:97[89][\s-]*(?:\d[\s-]*){9}\d)|(?:\d[\s-]*){9}[0-9X])/gi,
+				/(?:^|[^0-9X])((?:97[89][\s-]*(?:\d[\s-]*){9}\d)|(?:\d[\s-]*){9}[0-9X])(?:$|[^0-9X])/gi
+			]) {
+				for (let match of text.matchAll(pattern)) {
+					addCandidate(match[1]);
+				}
+			}
+			for (let part of text.split(/[\r\n;,，；]+/)) {
+				let normalizedPart = String(part || "").replace(/^ISBN(?:-1[03])?:?\s*/i, "");
+				let compact = normalizedPart.replace(/[^0-9X]/gi, "").toUpperCase();
+				if (compact.length === 10 || compact.length === 13) {
+					addCandidate(compact);
+					continue;
+				}
+				let isbn13Matches = normalizedPart.match(/97[89][\s-]*(?:\d[\s-]*){9}\d/gi) || [];
+				for (let match of isbn13Matches) {
+					addCandidate(match);
+				}
+				let withoutISBN13 = normalizedPart.replace(/97[89][\s-]*(?:\d[\s-]*){9}\d/gi, " ");
+				for (let match of withoutISBN13.matchAll(/(?:^|[^0-9X])((?:\d[\s-]*){9}[0-9X])(?:$|[^0-9X])/gi)) {
+					addCandidate(match[1]);
+				}
+			}
+			let values = [];
+			let seen = new Set();
+			for (let candidate of candidates) {
+				let value = String(candidate || "")
+				.toUpperCase()
+				.replace(/^ISBN(?:-1[03])?:?\s*/i, "")
+				.replace(/[^0-9X]/g, "");
+				if (!this.isValidISBN(value) || seen.has(value)) {
+					continue;
+				}
+				seen.add(value);
+				values.push(value);
+				for (let equivalent of this.getEquivalentISBNValues(value)) {
+					if (!seen.has(equivalent)) {
+						seen.add(equivalent);
+						values.push(equivalent);
+					}
+				}
+			}
+			return values;
+		},
+
+		getEquivalentISBNValues(value) {
+			value = String(value || "").toUpperCase().replace(/[^0-9X]/g, "");
+			let equivalents = [];
+			if (value.length === 10 && this.isValidISBN(value)) {
+				let base = `978${value.slice(0, 9)}`;
+				equivalents.push(base + this.computeISBN13CheckDigit(base));
+			}
+			else if (value.length === 13 && value.startsWith("978") && this.isValidISBN(value)) {
+				let base = value.slice(3, 12);
+				equivalents.push(base + this.computeISBN10CheckDigit(base));
+			}
+			return equivalents.filter(candidate => this.isValidISBN(candidate));
+		},
+
+		computeISBN13CheckDigit(first12) {
+			let total = 0;
+			for (let i = 0; i < 12; i++) {
+				total += (i % 2 === 0 ? 1 : 3) * Number(first12[i]);
+			}
+			return String((10 - (total % 10)) % 10);
+		},
+
+		computeISBN10CheckDigit(first9) {
+			let total = 0;
+			for (let i = 0; i < 9; i++) {
+				total += (10 - i) * Number(first9[i]);
+			}
+			let value = (11 - (total % 11)) % 11;
+			return value === 10 ? "X" : String(value);
+		},
+
+		isValidISBN(value) {
+			value = String(value || "").toUpperCase().replace(/[^0-9X]/g, "");
+			if (value.length === 13 && /^(978|979)\d{10}$/.test(value)) {
+				let total = 0;
+				for (let i = 0; i < value.length; i++) {
+					total += (i % 2 === 0 ? 1 : 3) * Number(value[i]);
+				}
+				return total % 10 === 0;
+			}
+			if (value.length === 10 && /^\d{9}[0-9X]$/.test(value)) {
+				let total = 0;
+				for (let i = 0; i < value.length; i++) {
+					let digit = value[i] === "X" ? 10 : Number(value[i]);
+					total += (10 - i) * digit;
+				}
+				return total % 11 === 0;
+			}
+			return false;
+		},
+
+		normalizeIdentifierValue(identifier) {
+			return this.normalizeIdentifierValues(identifier)[0] || "";
+		},
+
+		normalizeIdentifierValues(identifier) {
+			if (identifier?.type === "doi") {
+				let doi = this.normalizeDOI(identifier.value);
+				return doi ? [doi] : [];
+			}
+			if (identifier?.type === "isbn") {
+				return this.normalizeISBNValues(identifier.value);
+			}
+			return [];
+		},
+
 		async createLinkedPDFItemFromDOI({ doi, pdfPath, collectionID, index }) {
-			let item = await this.createRegularItemFromDOI({
-				doi,
+			return this.createLinkedPDFItemFromIdentifier({
+				identifier: { type: "doi", value: doi },
+				pdfPath,
+				collectionID,
+				index
+			});
+		},
+
+		async createLinkedPDFItemFromIdentifier({ identifier, pdfPath, collectionID, index }) {
+			let item = await this.createRegularItemFromIdentifier({
+				identifier,
 				pdfPath,
 				collectionID
 			});
+			let itemID = Number(item?.id) || 0;
+			if (!itemID) {
+				throw new Error("文献条目已创建但无法取得 itemID");
+			}
 
+			await this.createLinkedPDFAttachmentForItem(item, pdfPath, index, { firstImport: true });
+			return item;
+		},
+
+		async createLinkedPDFAttachmentForItem(item, pdfPath, index, options = {}) {
+			let itemID = Number(item?.id) || 0;
+			if (!itemID) {
+				throw new Error("无法为无效条目创建链接附件");
+			}
 			let attachment = new Zotero.Item("attachment");
 			attachment.libraryID = Zotero.Libraries.userLibraryID;
-			attachment.parentID = item.id;
+			attachment.parentID = itemID;
 			attachment.attachmentLinkMode = Zotero.Attachments.LINK_MODE_LINKED_FILE;
 			attachment.attachmentPath = pdfPath;
 			attachment.attachmentContentType = "application/pdf";
 			attachment.setField("title", PathUtils.filename(pdfPath));
 			await attachment.saveTx();
+			if (!attachment.id) {
+				throw new Error(`链接附件保存后没有 attachmentID：${pdfPath}`);
+			}
+			await this.runAutomaticPDFOperations(attachment, { firstImport: Boolean(options.firstImport) });
 			await this.indexAttachmentFileID(attachment, {
 				quiet: true,
 				index,
 				save: false
 			});
-			await this.runAutomaticPDFOperations(attachment);
-			return item;
+			return attachment;
 		},
 
 		async createRegularItemFromDOI({ doi, pdfPath, collectionID }) {
-			let metadata = await this.lookupMetadataByDOI(doi);
-			let item = this.createItemFromTranslatedMetadata(metadata, doi, pdfPath);
+			return this.createRegularItemFromIdentifier({
+				identifier: { type: "doi", value: doi },
+				pdfPath,
+				collectionID
+			});
+		},
+
+		async createRegularItemFromIdentifier({ identifier, pdfPath, collectionID }) {
+			let metadata = await this.lookupMetadataByIdentifier(identifier);
+			let item = this.createItemFromTranslatedMetadata(metadata, identifier, pdfPath);
 			item.libraryID = Zotero.Libraries.userLibraryID;
 			if (typeof item.setCollections === "function") {
 				item.setCollections(collectionID ? [collectionID] : []);
 			}
 			let itemID = await item.saveTx();
+			if (metadata) {
+				this._citationMetadataByItemID.set(Number(itemID), metadata);
+			}
 			if (collectionID && typeof item.setCollections !== "function") {
 				await Zotero.DB.queryAsync(
 					"INSERT OR IGNORE INTO collectionItems (collectionID, itemID) VALUES (?, ?)",
 					[collectionID, itemID]
 				);
 			}
-			return item;
+			let savedItem = await Zotero.Items.getAsync(Number(itemID));
+			return savedItem || item;
 		},
 
 		async renameSelectedPrimaryPDFsByRule() {
@@ -2444,7 +4608,7 @@
 			let reasons = new Map();
 			for (let attachment of attachments) {
 				try {
-					let result = await this.renameAttachmentByRule(attachment, { silent: true });
+					let result = await this.renameAttachmentByCitation(attachment, { silent: true });
 					if (result.ok && result.changed) {
 						await this.indexAttachmentFileID(attachment, { quiet: true });
 						await this.syncAttachmentMirrors(attachment);
@@ -2466,7 +4630,7 @@
 			this.showMoveReport(`主 PDF 按规则重命名完成：共检查 ${attachments.length} 个主 PDF，已重命名 ${renamed} 个${skipped ? `，跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。`);
 		},
 
-		async renameAttachmentByRule(attachment, options = {}) {
+		async renameAttachmentByCitation(attachment, options = {}) {
 			if (!attachment?.isFileAttachment?.()) {
 				return { ok: false, changed: false, reason: "不是文件附件" };
 			}
@@ -2485,20 +4649,27 @@
 				return { ok: false, changed: false, reason: "没有父条目" };
 			}
 
-			let pattern = String(options.pattern || this.getPref("attachmentRenamePattern", DEFAULT_ATTACHMENT_RENAME_PATTERN) || DEFAULT_ATTACHMENT_RENAME_PATTERN).trim();
-			let baseName = this.buildAttachmentRenameBaseName(parent, pattern);
-			if (!baseName) {
-				return { ok: false, changed: false, reason: "无法生成文件名" };
+			let doi = this.normalizeDOI(parent.getField?.("DOI"));
+			if (!doi) {
+				return { ok: false, changed: false, reason: "父条目没有 DOI" };
+			}
+			let metadata = options.metadata
+				|| this._citationMetadataByItemID.get(Number(parent.id))
+				|| await this.lookupMetadataByDOI(doi);
+			if (!metadata) {
+				return { ok: false, changed: false, reason: "无法通过 DOI 获取引用信息" };
 			}
 
-			let extension = Zotero.File.getExtension(sourcePath) || "pdf";
-			let destinationPath = PathUtils.join(this.getParentPath(sourcePath), `${baseName}.${extension}`);
+			let filenameResult = this.buildCitationFilename(parent, metadata, sourcePath);
+			if (!filenameResult.filename) {
+				return { ok: false, changed: false, reason: filenameResult.reason || "无法生成文件名" };
+			}
+			let destinationPath = PathUtils.join(this.getParentPath(sourcePath), filenameResult.filename);
 			if (this.pathsEqual(sourcePath, destinationPath)) {
 				return { ok: true, changed: false, reason: "文件名已符合规则" };
 			}
-			destinationPath = await this.getUniqueDestinationPath(destinationPath);
-			if (!destinationPath) {
-				return { ok: false, changed: false, reason: "无法生成唯一文件名" };
+			if (await IOUtils.exists(destinationPath)) {
+				return { ok: false, changed: false, reason: "目标文件名已存在" };
 			}
 
 			await IOUtils.move(sourcePath, destinationPath);
@@ -2522,39 +4693,88 @@
 			}
 		},
 
-		buildAttachmentRenameBaseName(item, pattern) {
-			let replacements = this.getAttachmentRenameReplacements(item);
-			let name = String(pattern || DEFAULT_ATTACHMENT_RENAME_PATTERN).replace(/\{(author|authors|year|title|doi)\}/gi, (match, key) => {
-				return replacements[key.toLowerCase()] || "";
-			});
-			return this.sanitizeFilename(name.replace(/\s+/g, " ").trim()).slice(0, 180);
+		buildCitationFilename(item, metadata, sourcePath) {
+			let creators = Array.isArray(metadata?.creators) ? metadata.creators : [];
+			if (!creators.length) {
+				try {
+					creators = item.getCreators?.() || [];
+				}
+				catch (e) {
+					Zotero.logError(e);
+				}
+			}
+			let authors = creators.filter(creator => !creator.creatorType || creator.creatorType === "author");
+			let editors = creators.filter(creator => creator.creatorType === "editor");
+			let people = authors.length ? authors : editors;
+			let authorLabel = this.getCitationPeopleLabel(people);
+			if (!authorLabel) {
+				return { filename: "", reason: "引用信息没有作者或编者" };
+			}
+			if (!authors.length && editors.length) {
+				authorLabel += editors.length === 1 ? " (ed.)" : " (eds.)";
+			}
+
+			let yearText = [metadata?.date, metadata?.year, item.getField?.("date")]
+				.map(value => String(value || ""))
+				.find(value => /\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b/.test(value)) || "";
+			let year = (yearText.match(/\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b/) || [])[1] || "n.d.";
+			let title = this.stripCitationMarkup(this.firstCitationText(metadata?.title) || item.getField?.("title") || "Untitled").replace(/\?+$/g, "");
+			let subtitle = this.stripCitationMarkup(this.firstCitationText(metadata?.subtitle) || "").replace(/\?+$/g, "");
+			let mainTitle = title;
+			if (!subtitle && title.includes(":")) {
+				let parts = title.split(":");
+				mainTitle = parts.shift()?.trim() || title;
+				subtitle = parts.join(":").trim();
+			}
+			mainTitle = this.cleanCitationFilenamePiece(mainTitle) || "Untitled";
+			subtitle = this.cleanCitationFilenamePiece(subtitle);
+
+			let extension = Zotero.File.getExtension(sourcePath) || "pdf";
+			let parentPath = this.getParentPath(sourcePath);
+			let mainStem = `${authorLabel} ${year} ${mainTitle}`.trim();
+			let fullStem = subtitle ? `${mainStem}  ${subtitle}` : mainStem;
+			let fullFilename = `${fullStem}.${extension}`;
+			if (PathUtils.join(parentPath, fullFilename).length <= MAX_CITATION_PATH_LENGTH) {
+				return { filename: fullFilename, omittedSubtitle: false };
+			}
+			let mainFilename = `${mainStem}.${extension}`;
+			if (PathUtils.join(parentPath, mainFilename).length <= MAX_CITATION_PATH_LENGTH) {
+				return { filename: mainFilename, omittedSubtitle: Boolean(subtitle) };
+			}
+			return { filename: "", reason: `仅保留主标题后路径仍超过 ${MAX_CITATION_PATH_LENGTH} 字符` };
 		},
 
-		getAttachmentRenameReplacements(item) {
-			let creators = [];
-			try {
-				creators = item.getCreators?.() || [];
-			}
-			catch (e) {
-				Zotero.logError(e);
-			}
-			let authorNames = creators
-				.map(creator => creator.lastName || creator.name || [creator.firstName, creator.lastName].filter(Boolean).join(" "))
-				.map(name => String(name || "").trim())
+		getCitationPeopleLabel(people) {
+			let names = (people || [])
+				.map(person => this.cleanCitationFilenamePiece(person?.lastName || person?.family || person?.name || ""))
 				.filter(Boolean);
-			let firstAuthor = authorNames[0] || "Unknown";
-			let authors = authorNames.length > 1 ? `${firstAuthor} et al.` : firstAuthor;
-			let title = String(item.getField?.("title") || "").trim();
-			let date = String(item.getField?.("date") || "").trim();
-			let year = (date.match(/\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b/) || [])[1] || "";
-			let doi = this.normalizeDOI(item.getField?.("DOI"));
-			return {
-				author: firstAuthor,
-				authors,
-				year,
-				title,
-				doi
-			};
+			if (!names.length) {
+				return "";
+			}
+			if (names.length === 1) {
+				return names[0];
+			}
+			if (names.length === 2) {
+				return `${names[0]} & ${names[1]}`;
+			}
+			return `${names[0]} et al.`;
+		},
+
+		firstCitationText(value) {
+			return Array.isArray(value) ? String(value[0] || "") : String(value || "");
+		},
+
+		stripCitationMarkup(value) {
+			return String(value || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").replace(/\s+®/g, "®").trim();
+		},
+
+		cleanCitationFilenamePiece(value) {
+			return String(value || "")
+				.normalize("NFKC")
+				.replace(/[<>:"/\\|?*\x00-\x1F]/g, " ")
+				.replace(/\s+/g, " ")
+				.replace(/[. ]+$/g, "")
+				.trim();
 		},
 
 		sanitizeFilename(name) {
@@ -2565,7 +4785,7 @@
 				.trim();
 		},
 
-		async runAutomaticPDFOperations(attachment) {
+		async runAutomaticPDFOperations(attachment, options = {}) {
 			if (!attachment?.isFileAttachment?.()) {
 				return;
 			}
@@ -2575,11 +4795,24 @@
 			}
 
 			try {
-				if (this.getBoolPref("autoWritePDFDOIMetadata", true)) {
+				let isPrimaryPDF = await this.isPrimaryPDFAttachment(attachment);
+				if (isPrimaryPDF && this.getBoolPref("autoWritePDFDOIMetadata", true)) {
 					await this.writeAttachmentPDFDOIMetadata(attachment, { silent: true });
 				}
 
-				let isPrimaryPDF = await this.isPrimaryPDFAttachment(attachment);
+				if (options.firstImport
+					&& isPrimaryPDF
+					&& this.getBoolPref("autoRenameNewAttachments", false)
+					&& !this._automaticCitationRenameHandledAttachmentIDs.has(Number(attachment.id))) {
+					let renameResult = await this.renameAttachmentByCitation(attachment, {
+						silent: true,
+						metadata: this._citationMetadataByItemID.get(Number(attachment.parentItem?.id))
+					});
+					if (renameResult.ok) {
+						this._automaticCitationRenameHandledAttachmentIDs.add(Number(attachment.id));
+						path = attachment.getFilePath?.() || renameResult.path || path;
+					}
+				}
 				if (isPrimaryPDF && this.getBoolPref("autoAlignPDFPageLabels", true)) {
 					await this.alignAttachmentPDFPageLabels(attachment, { silent: true });
 				}
@@ -2598,6 +4831,9 @@
 			}
 			catch (e) {
 				Zotero.logError(e);
+			}
+			finally {
+				this._citationMetadataByItemID.delete(Number(attachment.parentItem?.id));
 			}
 		},
 
@@ -2792,19 +5028,36 @@
 					values.set(label, value);
 				}
 			}
+			let extra = String(item.getField?.("extra") || "");
+			let existingValues = this.parseExtraKeyValueLines(extra);
+			for (let [, label] of fields) {
+				let existing = this.getExtraValueByNormalizedKeys(existingValues, [
+					label,
+					`${label} Date`
+				]);
+				if (existing) {
+					values.delete(label);
+				}
+			}
 			if (!values.size) {
 				return { changed: false };
 			}
 
-			let extra = String(item.getField?.("extra") || "");
 			let lines = extra ? extra.split(/\r?\n/) : [];
 			let seen = new Set();
 			lines = lines.map(line => {
-				let match = line.match(/^\s*(Received|Revised|Accepted|Online)\s*:\s*(.*?)\s*$/i);
+				let match = line.match(/^\s*([^:]+?)\s*:\s*(.*?)\s*$/);
 				if (!match) {
 					return line;
 				}
-				let canonical = fields.find(([, label]) => label.toLowerCase() === match[1].toLowerCase())?.[1] || match[1];
+				let normalizedKey = this.normalizeExtraKey(match[1]);
+				let canonical = fields.find(([, label]) => [
+					this.normalizeExtraKey(label),
+					this.normalizeExtraKey(`${label} Date`)
+				].includes(normalizedKey))?.[1];
+				if (!canonical || String(match[2] || "").trim()) {
+					return line;
+				}
 				if (!values.has(canonical)) {
 					return line;
 				}
@@ -2850,6 +5103,17 @@
 			}
 			let values = this.parseExtraKeyValueLines(item.getField?.("extra") || "");
 			return ARTICLE_HISTORY_INFO_ROWS.some(definition => this.getExtraValueByNormalizedKeys(values, [
+				definition.key,
+				`${definition.key} Date`
+			]));
+		},
+
+		hasAllArticleHistoryDateValues(item) {
+			if (!item?.isRegularItem?.()) {
+				return false;
+			}
+			let values = this.parseExtraKeyValueLines(item.getField?.("extra") || "");
+			return ARTICLE_HISTORY_INFO_ROWS.every(definition => this.getExtraValueByNormalizedKeys(values, [
 				definition.key,
 				`${definition.key} Date`
 			]));
@@ -2989,11 +5253,8 @@
 				"    doc = fitz.open(path)",
 				"    total = len(doc)",
 				"    pages = []",
-				"    if total:",
-				"        pages.append(0)",
-				"    if total > 1:",
-				"        pages.append(total - 1)",
-				"    for i in range(1, min(total, 4)):",
+				"    edge_pages = list(range(0, min(total, 4))) + list(range(max(0, total - 4), total))",
+				"    for i in edge_pages:",
 				"        if i not in pages:",
 				"            pages.append(i)",
 				"    history = {'received': '', 'revised': '', 'accepted': '', 'online': ''}",
@@ -3068,13 +5329,16 @@
 			let attachments = await this.getAllUserFileAttachments();
 			attachments = attachments.filter(attachment => this.isPDFFilePath(attachment.getFilePath?.(), attachment));
 			if (!attachments.length) {
+				if (options.silent) {
+					return { total: 0, written: 0, skipped: 0, skippedExisting: 0 };
+				}
 				if (options.softReport) {
 					this.showSoftReport("个人库中未找到 PDF 文件附件。", 5000);
 				}
 				else {
 					this.showPreferenceAlert("文章历史时间线提取结果", "个人库中未找到 PDF 文件附件。");
 				}
-				return;
+				return { total: 0, written: 0, skipped: 0, skippedExisting: 0 };
 			}
 
 			let useProgressWindow = options.useProgressWindow !== false;
@@ -3090,8 +5354,15 @@
 			for (let i = 0; i < attachments.length; i++) {
 				let attachment = attachments[i];
 				try {
+					let path = attachment.getFilePath?.() || "";
+					if (options.requireManagedPath
+						&& (!path || !(await IOUtils.exists(path)) || !this.isPathInsideRoot(path, this.getAttachmentMoveRoot()))) {
+						skipped++;
+						this.countReason(reasons, "附件路径失效或位于顶层路径外");
+						continue;
+					}
 					let parent = attachment.parentItem;
-					if (parent && this.hasAnyArticleHistoryDateValue(parent)) {
+					if (parent && this.hasAllArticleHistoryDateValues(parent)) {
 						skipped++;
 						skippedExisting++;
 						continue;
@@ -3129,12 +5400,16 @@
 			let otherSkipped = skipped - skippedExisting;
 			let message = `全库文章历史时间线提取完成：共检查 ${attachments.length} 个 PDF 附件，已写入 ${written} 个，已存在跳过 ${skippedExisting} 个${otherSkipped ? `，其他跳过 ${otherSkipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。耗时约 ${seconds} 秒。`;
 			this.updateProgressWindow(progressWindow, "文章历史时间线提取完成", `写入 ${written}，已存在 ${skippedExisting}，跳过 ${skipped}，耗时约 ${seconds} 秒`, 6000);
+			if (options.silent) {
+				return { total: attachments.length, written, skipped, skippedExisting, message };
+			}
 			if (options.softReport) {
 				this.showSoftReport(message, 8000);
 			}
 			else {
 				this.showPreferenceAlert("文章历史时间线提取结果", message);
 			}
+			return { total: attachments.length, written, skipped, skippedExisting, message };
 		},
 
 		async alignAttachmentPDFPageLabels(attachment, options = {}) {
@@ -3524,17 +5799,25 @@
 			let attachments = await this.getAllUserFileAttachments();
 			attachments = attachments.filter(attachment => this.isPDFFilePath(attachment.getFilePath?.(), attachment));
 			if (!attachments.length) {
+				if (options.silent) {
+					return { total: 0, written: 0, pageLabelsAligned: 0, viewerPreferencesUpdated: 0, skipped: 0 };
+				}
 				if (options.softReport) {
 					this.showSoftReport("个人库中未找到 PDF 文件附件。", 5000);
 				}
 				else {
 					this.showPreferenceAlert("PDF DOI 元数据写入结果", "个人库中未找到 PDF 文件附件。");
 				}
-				return;
+				return { total: 0, written: 0, pageLabelsAligned: 0, viewerPreferencesUpdated: 0, skipped: 0 };
 			}
 
+			let writeDOIMetadata = options.writeDOIMetadata !== false;
+			let alignPageLabels = options.alignPageLabels !== false;
+			let openToFirstPage = Boolean(options.openToFirstPage);
+			let displayTitleFileName = Boolean(options.displayTitleFileName);
 			let written = 0;
 			let pageLabelsAligned = 0;
+			let viewerPreferencesUpdated = 0;
 			let skipped = 0;
 			let reasons = new Map();
 			let startedAt = Date.now();
@@ -3546,25 +5829,55 @@
 			for (let i = 0; i < attachments.length; i++) {
 				let attachment = attachments[i];
 				try {
-					let changedAnything = false;
-					let result = await this.writeAttachmentPDFDOIMetadata(attachment, { silent: true });
-					if (result.ok && result.changed) {
-						written++;
-						changedAnything = true;
+					let path = attachment.getFilePath?.() || "";
+					if (options.requireManagedPath
+						&& (!path || !(await IOUtils.exists(path)) || !this.isPathInsideRoot(path, this.getAttachmentMoveRoot()))) {
+						skipped++;
+						this.countReason(reasons, "附件路径失效或位于顶层路径外");
+						continue;
 					}
-					else {
-						this.countReason(reasons, `DOI：${result.reason || "未知原因"}`);
+					let changedAnything = false;
+					let isPrimaryPDF = (writeDOIMetadata || alignPageLabels)
+						? await this.isPrimaryPDFAttachment(attachment)
+						: false;
+					if (writeDOIMetadata && isPrimaryPDF) {
+						let result = await this.writeAttachmentPDFDOIMetadata(attachment, { silent: true });
+						if (result.ok && result.changed) {
+							written++;
+							changedAnything = true;
+						}
+						else if (!result.ok) {
+							this.countReason(reasons, `DOI：${result.reason || "未知原因"}`);
+						}
 					}
 
-					if (await this.isPrimaryPDFAttachment(attachment)) {
+					if (alignPageLabels && isPrimaryPDF) {
 						let pageResult = await this.alignAttachmentPDFPageLabels(attachment, { silent: true });
 						if (pageResult.ok && pageResult.changed) {
 							pageLabelsAligned++;
 							changedAnything = true;
 						}
-						else {
+						else if (!pageResult.ok) {
 							this.countReason(reasons, `页码：${pageResult.reason || "未知原因"}`);
 						}
+					}
+
+					if (openToFirstPage || displayTitleFileName) {
+						let viewerResult = await this.writePDFViewerPreferencesWithPikepdf(attachment.getFilePath(), {
+							openToFirstPage,
+							displayTitleFileName
+						});
+						if (viewerResult.ok && viewerResult.changed) {
+							viewerPreferencesUpdated++;
+							changedAnything = true;
+						}
+						else if (!viewerResult.ok) {
+							this.countReason(reasons, `查看设置：${viewerResult.reason || "未知原因"}`);
+						}
+					}
+
+					if (changedAnything) {
+						await this.indexAttachmentFileID(attachment, { quiet: true });
 					}
 
 					if (!changedAnything) {
@@ -3584,47 +5897,87 @@
 						total: attachments.length,
 						written,
 						pageLabelsAligned,
+						viewerPreferencesUpdated,
 						skipped
 					});
-					this.updateProgressWindow(progressWindow, "正在写入 PDF DOI 元数据并对齐页码", `已处理 ${processed} / ${attachments.length}，DOI ${written}，页码 ${pageLabelsAligned}，跳过 ${skipped}`);
+					this.updateProgressWindow(progressWindow, "正在更新全库 PDF", `已处理 ${processed} / ${attachments.length}，DOI ${written}，页码 ${pageLabelsAligned}，查看设置 ${viewerPreferencesUpdated}`);
 				}
 			}
 
 			let seconds = Math.round((Date.now() - startedAt) / 1000);
 			let reasonText = this.formatReasons(reasons);
-			let message = `全库 PDF DOI 元数据写入与页码对齐完成：共检查 ${attachments.length} 个 PDF 附件，DOI 已写入 ${written} 个，页码已对齐 ${pageLabelsAligned} 个${skipped ? `，跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。耗时约 ${seconds} 秒。`;
-			this.updateProgressWindow(progressWindow, "PDF DOI 元数据写入与页码对齐完成", `DOI ${written}，页码 ${pageLabelsAligned}，跳过 ${skipped}，耗时约 ${seconds} 秒`, 6000);
+			let message = `全库 PDF 更新完成：共检查 ${attachments.length} 个 PDF 附件，DOI 元数据更新 ${written} 个，页码对齐 ${pageLabelsAligned} 个，查看设置更新 ${viewerPreferencesUpdated} 个${skipped ? `，无变化或跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。耗时约 ${seconds} 秒。`;
+			this.updateProgressWindow(progressWindow, "全库 PDF 更新完成", `DOI ${written}，页码 ${pageLabelsAligned}，查看设置 ${viewerPreferencesUpdated}，耗时约 ${seconds} 秒`, 6000);
+			let result = { total: attachments.length, written, pageLabelsAligned, viewerPreferencesUpdated, skipped, message };
+			if (options.silent) {
+				return result;
+			}
 			if (options.softReport) {
 				this.showSoftReport(message, 8000);
 			}
 			else {
 				this.showPreferenceAlert("PDF DOI 元数据写入结果", message);
 			}
+			return result;
 		},
 
 		async lookupMetadataByDOI(doi) {
-			try {
-				let translate = new Zotero.Translate.Search();
-				translate.setIdentifier({
-					itemType: "journalArticle",
-					DOI: doi
-				});
-				let translators = await translate.getTranslators();
-				if (!translators?.length) {
-					return null;
-				}
-				translate.setTranslator(translators);
-				let items = await translate.translate({ libraryID: false });
-				return items?.[0] || null;
-			}
-			catch (e) {
-				Zotero.logError(e);
-				return null;
-			}
+			return this.lookupMetadataByIdentifier({ type: "doi", value: doi });
 		},
 
-		createItemFromTranslatedMetadata(metadata, doi, pdfPath) {
+		async lookupMetadataByIdentifier(identifier) {
+			let attempts = this.getIdentifierLookupAttempts(identifier);
+			for (let attempt of attempts) {
+				let translate = new Zotero.Translate.Search();
+				try {
+					translate.setIdentifier(attempt);
+					let translators = await translate.getTranslators();
+					if (!translators?.length) {
+						continue;
+					}
+					translate.setTranslator(translators);
+					let items = await translate.translate({ libraryID: false });
+					if (items?.[0]) {
+						return items[0];
+					}
+				}
+				catch (e) {
+					Zotero.debug(`ZotLink: identifier lookup attempt failed: ${e.message || e}`, 1);
+				}
+			}
+			return null;
+		},
+
+		getIdentifierLookupAttempts(identifier) {
+			let type = identifier?.type || "doi";
+			let value = this.normalizeIdentifierValue(identifier);
+			if (!value) {
+				return [];
+			}
+			if (type === "isbn") {
+				return [
+					value,
+					`ISBN ${value}`,
+					{
+						itemType: "book",
+						ISBN: value
+					}
+				];
+			}
+			return [
+				value,
+				{
+					itemType: "journalArticle",
+					DOI: value
+				}
+			];
+		},
+
+		createItemFromTranslatedMetadata(metadata, identifier, pdfPath) {
 			let itemType = metadata?.itemType || "journalArticle";
+			if (identifier?.type === "isbn" && !metadata?.itemType) {
+				itemType = "book";
+			}
 			let item = new Zotero.Item(itemType);
 			let skipped = new Set([
 				"itemType",
@@ -3671,8 +6024,11 @@
 			if (!item.getField("title")) {
 				item.setField("title", this.titleFromPDFPath(pdfPath));
 			}
-			if (!item.getField("DOI")) {
-				item.setField("DOI", doi);
+			if (identifier?.type === "doi" && !item.getField("DOI")) {
+				item.setField("DOI", this.normalizeDOI(identifier.value));
+			}
+			if (identifier?.type === "isbn" && !item.getField("ISBN")) {
+				item.setField("ISBN", this.normalizeISBN(identifier.value));
 			}
 			return item;
 		},
@@ -3685,14 +6041,22 @@
 		},
 
 		async extractDOIFromPDFMetadata(pdfPath) {
+			let identifier = await this.extractIdentifierFromPDFMetadata(pdfPath);
+			return identifier.type === "doi" ? identifier.value : "";
+		},
+
+		async extractIdentifierFromPDFMetadata(pdfPath) {
 			let outputPath = this.getTempTextPath("zotlink-pdf-doi");
 			let scriptPath = this.getTempTextPath("zotlink-pdf-doi").replace(/\.txt$/i, ".py");
 			let script = [
 				"import html, re, sys, zlib",
 				"path, output = sys.argv[1], sys.argv[2]",
 				"doi_re = re.compile(rb'10\\.\\d{4,9}/[-._;()/:A-Z0-9]+', re.I)",
+				"isbn_label_re = re.compile(r'ISBN(?:-1[03])?[:=]?\\s*([0-9X][0-9X\\s-]{8,24}[0-9X])', re.I)",
+				"isbn_run_re = re.compile(r'(?<!\\d)((?:97[89][0-9X\\s-]{10,24})|(?:[0-9][0-9X\\s-]{8,18}[0-9X]))(?!\\d)', re.I)",
 				"ref_re = re.compile(rb'(\\d+)\\s+(\\d+)\\s+obj\\b')",
 				"doi = ''",
+				"isbn = ''",
 				"def decoded_texts(raw):",
 				"    out = []",
 				"    for enc in ('utf-8-sig', 'utf-16', 'utf-16-be', 'utf-16-le', 'latin-1'):",
@@ -3715,6 +6079,60 @@
 				"        value = re.sub(r'/s/uri.*$', '', value, flags=re.I)",
 				"        return value.rstrip(').,;:]')",
 				"    return ''",
+				"def isbn_checksum_ok(value):",
+				"    value = re.sub(r'[^0-9X]', '', value.upper())",
+				"    if len(value) == 13 and value.startswith(('978', '979')):",
+				"        total = sum((1 if i % 2 == 0 else 3) * int(ch) for i, ch in enumerate(value))",
+				"        return total % 10 == 0",
+				"    if len(value) == 10:",
+				"        total = 0",
+				"        for i, ch in enumerate(value):",
+				"            n = 10 if ch == 'X' and i == 9 else (int(ch) if ch.isdigit() else -1)",
+				"            if n < 0:",
+				"                return False",
+				"            total += (10 - i) * n",
+				"        return total % 11 == 0",
+				"    return False",
+				"def clean_isbn(raw):",
+				"    for text in decoded_texts(raw):",
+				"        text = html.unescape(text)",
+				"        candidates = []",
+				"        candidates.extend(m.group(1) for m in isbn_label_re.finditer(text))",
+				"        candidates.extend(m.group(1) for m in isbn_run_re.finditer(text))",
+				"        for candidate in candidates:",
+				"            value = re.sub(r'[^0-9X]', '', candidate.upper())",
+				"            if isbn_checksum_ok(value):",
+				"                return value",
+				"    return ''",
+				"def identifier_from_pikepdf(path):",
+				"    try:",
+				"        import pikepdf",
+				"    except Exception:",
+				"        return '', ''",
+				"    chunks = []",
+				"    try:",
+				"        with pikepdf.Pdf.open(path) as pdf:",
+				"            try:",
+				"                info = pdf.docinfo or {}",
+				"                for key, value in info.items():",
+				"                    chunks.append(str(key))",
+				"                    chunks.append(str(value))",
+				"            except Exception:",
+				"                pass",
+				"            try:",
+				"                with pdf.open_metadata() as meta:",
+				"                    try:",
+				"                        for key, value in meta.items():",
+				"                            chunks.append(str(key))",
+				"                            chunks.append(str(value))",
+				"                    except Exception:",
+				"                        chunks.append(str(meta))",
+				"            except Exception:",
+				"                pass",
+				"    except Exception:",
+				"        return '', ''",
+				"    raw = '\\n'.join(chunks).encode('utf-8', 'ignore')",
+				"    return clean(raw), clean_isbn(raw)",
 				"def decode_pdf_literal(raw):",
 				"    out = bytearray()",
 				"    i = 0",
@@ -3777,6 +6195,24 @@
 				"                if found:",
 				"                    return found",
 				"    return ''",
+				"def isbn_from_metadata_fields(raw):",
+				"    for m in re.finditer(rb'/(?:isbn|ISBN|Isbn|prism:isbn|dc:identifier|Identifier)\\s*(\\((?:\\\\.|[^\\\\)])*\\)|<[^<>\\s]+>|[^/<>{}\\[\\]\\s]+)', raw, re.I):",
+				"        found = clean_isbn(decode_pdf_value(m.group(1)))",
+				"        if found:",
+				"            return found",
+				"    xml_patterns = [",
+				"        r'<[^>]*(?:isbn|identifier)[^>]*>\\s*([^<]+)',",
+				"        r'(?:isbn|ISBN|identifier)\\s*=\\s*[\\\"\\']([^\\\"\\']+)',",
+				"        r'(?:isbn|ISBN|identifier)\\s*[:=]\\s*([^\\r\\n<>]+)'",
+				"    ]",
+				"    for text in decoded_texts(raw):",
+				"        text = html.unescape(text)",
+				"        for pat in xml_patterns:",
+				"            for m in re.finditer(pat, text, re.I):",
+				"                found = clean_isbn(m.group(1).encode('utf-8', 'ignore'))",
+				"                if found:",
+				"                    return found",
+				"    return ''",
 				"def object_body(data, obj_num):",
 				"    pat = re.compile(rb'\\b' + str(obj_num).encode() + rb'\\s+\\d+\\s+obj\\b')",
 				"    m = pat.search(data)",
@@ -3808,7 +6244,15 @@
 				"            yield data[m.end():end]",
 				"def looks_like_metadata(body):",
 				"    low = body[:4096].lower()",
-				"    return (b'/metadata' in low or b'/info' in low or b'xmpmeta' in low or b'rdf:' in low or b'prism:doi' in low or b'dc:identifier' in low or b'/doi' in low or b'/doi' in body.lower())",
+				"    return (b'/metadata' in low or b'/info' in low or b'xmpmeta' in low or b'rdf:' in low or b'prism:doi' in low or b'prism:isbn' in low or b'dc:identifier' in low or b'/doi' in low or b'/isbn' in low or b'/doi' in body.lower() or b'/isbn' in body.lower())",
+				"doi, isbn = identifier_from_pikepdf(path)",
+				"if doi or isbn:",
+				"    with open(output, 'w', encoding='utf-8') as out:",
+				"        if doi:",
+				"            out.write('doi\\t' + doi)",
+				"        else:",
+				"            out.write('isbn\\t' + isbn)",
+				"    sys.exit(0)",
 				"with open(path, 'rb') as f:",
 				"    data = f.read()",
 				"# Strict-ish metadata path: XMP Metadata streams and Info dictionaries.",
@@ -3825,25 +6269,26 @@
 				"        continue",
 				"    stream = stream_data(body)",
 				"    doi = doi_from_metadata_fields(stream) or doi_from_metadata_fields(body)",
-				"    if not doi:",
-				"        doi = clean(stream) or clean(body)",
+				"    isbn = isbn_from_metadata_fields(stream) or isbn_from_metadata_fields(body)",
 				"    if doi:",
 				"        break",
 				"# Metadata fallback: inspect objects that look like Info/XMP/custom metadata even if they were not referenced in the trailer/catalog pattern above.",
-				"if not doi:",
+				"if not doi and not isbn:",
 				"    for body in iter_object_bodies(data):",
 				"        if not looks_like_metadata(body):",
 				"            continue",
 				"        stream = stream_data(body)",
-				"        doi = doi_from_metadata_fields(stream) or doi_from_metadata_fields(body) or clean(stream) or clean(body)",
-				"        if doi:",
+				"        doi = doi_from_metadata_fields(stream) or doi_from_metadata_fields(body)",
+				"        isbn = isbn_from_metadata_fields(stream) or isbn_from_metadata_fields(body)",
+				"        if doi or isbn:",
 				"            break",
-				"# Lightweight fallback: limited bytes near file start/end, not full-text extraction.",
-				"if not doi:",
-				"    limited = data[:2 * 1024 * 1024] + b'\\n' + data[-1024 * 1024:]",
-				"    doi = clean(limited)",
 				"with open(output, 'w', encoding='utf-8') as out:",
-				"    out.write(doi)"
+				"    if doi:",
+				"        out.write('doi\\t' + doi)",
+				"    elif isbn:",
+				"        out.write('isbn\\t' + isbn)",
+				"    else:",
+				"        out.write('')"
 			].join("\n");
 			try {
 				await IOUtils.write(scriptPath, new TextEncoder().encode(script));
@@ -3853,11 +6298,20 @@
 					pdfPath,
 					outputPath
 				]);
-				return this.normalizeDOI(await this.readCommandOutputFile(outputPath, ""));
+				let raw = String(await this.readCommandOutputFile(outputPath, "") || "").trim();
+				let [type, ...parts] = raw.split("\t");
+				let value = parts.join("\t");
+				if (type === "doi") {
+					return { type, value: this.normalizeDOI(value) };
+				}
+				if (type === "isbn") {
+					return { type, value: this.normalizeISBN(value) };
+				}
+				return { type: "", value: "" };
 			}
 			catch (e) {
 				Zotero.logError(e);
-				return "";
+				return { type: "", value: "" };
 			}
 			finally {
 				for (let path of [scriptPath, outputPath]) {
@@ -4026,7 +6480,8 @@
 			let collection = Zotero.Collections.get(collectionID);
 			while (collection) {
 				names.unshift(this.sanitizePathSegment(collection.name));
-				collection = collection.parentID ? Zotero.Collections.get(collection.parentID) : null;
+				let parentID = this.getCollectionParentIDValue(collection);
+				collection = parentID ? Zotero.Collections.get(parentID) : null;
 			}
 			return names.filter(Boolean);
 		},
@@ -4043,7 +6498,8 @@
 				let collection = Zotero.Collections.get(collectionID);
 				while (collection) {
 					names.unshift(this.sanitizePathSegment(collection.name));
-					collection = collection.parentID ? Zotero.Collections.get(collection.parentID) : null;
+					let parentID = this.getCollectionParentIDValue(collection);
+					collection = parentID ? Zotero.Collections.get(parentID) : null;
 				}
 				let path = names.filter(Boolean);
 				if (path.length) {
@@ -4087,9 +6543,53 @@
 			let collection = Zotero.Collections.get(collectionID);
 			while (collection) {
 				names.unshift(this.sanitizePathSegment(collection.name));
-				collection = collection.parentID ? Zotero.Collections.get(collection.parentID) : null;
+				let parentID = this.getCollectionParentIDValue(collection);
+				collection = parentID ? Zotero.Collections.get(parentID) : null;
 			}
 			return names.filter(Boolean);
+		},
+
+		async getCollectionPathByIDAsync(collectionID) {
+			collectionID = Number(collectionID) || 0;
+			if (!collectionID) {
+				return [];
+			}
+			try {
+				let rows = await Zotero.DB.queryAsync(
+					"SELECT collectionID, collectionName, parentCollectionID FROM collections WHERE libraryID=?",
+					[Zotero.Libraries.userLibraryID]
+				);
+				let byID = new Map();
+				for (let row of rows || []) {
+					let id = Number(row.collectionID || row.collectionid || row[0]);
+					if (!id) {
+						continue;
+					}
+					byID.set(id, {
+						id,
+						name: row.collectionName || row.collectionname || row[1] || "",
+						parentID: row.parentCollectionID || row.parentcollectionid || row.parentCollectionId || row[2] || null
+					});
+				}
+				let names = [];
+				let current = byID.get(collectionID);
+				let guard = new Set();
+				while (current?.id && !guard.has(Number(current.id))) {
+					guard.add(Number(current.id));
+					if (current.name) {
+						names.unshift(this.sanitizePathSegment(current.name));
+					}
+					let parentID = current.parentID ? Number(current.parentID) : null;
+					current = parentID ? byID.get(parentID) : null;
+				}
+				if (names.length) {
+					return names.filter(Boolean);
+				}
+			}
+			catch (e) {
+				Zotero.logError(e);
+			}
+			return this.getCollectionPathByID(collectionID);
 		},
 
 		async syncAttachmentMirrors(attachment, options = {}) {
@@ -4099,7 +6599,14 @@
 
 			let currentPath = attachment.getFilePath();
 			if (!currentPath || !(await IOUtils.exists(currentPath))) {
-				return { changed: false, reason: "源文件不存在" };
+				let relocatedPath = await this.getRelocatedPathForCollectionPathChanges(currentPath, options.collectionPathChanges);
+				if (relocatedPath) {
+					await this.updateAttachmentLinkedPath(attachment, relocatedPath);
+					currentPath = relocatedPath;
+				}
+				else {
+					return { changed: false, reason: "源文件不存在" };
+				}
 			}
 
 			let locator = await this.getWindowsFileID(currentPath, { quiet: true });
@@ -4117,15 +6624,21 @@
 				return { changed: false, reason: "没有集合路径" };
 			}
 
-			let preferredPath = this.getPreferredPrimaryPath(desiredRecords, options.preferredCollectionID);
+			let preferredCollectionID = options.preferredCollectionID
+				|| this.getRelocatedPreferredCollectionID(currentPath, fileName, options.collectionPathChanges);
+			let preferredPath = this.getPreferredPrimaryPath(desiredRecords, preferredCollectionID);
 			let currentIsDesired = desiredPaths.some(path => this.pathsEqual(path, currentPath));
 			let primaryPath = currentPath;
 			let changed = false;
+			let movePending = false;
 
 			if (!currentIsDesired || (preferredPath && !this.pathsEqual(preferredPath, currentPath))) {
 				let targetPrimaryPath = preferredPath || desiredPaths[0];
 				let existingPrimary = await this.getExistingPathWithFileID(targetPrimaryPath, locator.fileID);
-				let replacement = existingPrimary || await this.movePrimaryAttachmentFile(currentPath, targetPrimaryPath, diagnostics);
+				let moveResult = existingPrimary
+					? { path: existingPrimary, targetPath: existingPrimary, error: "" }
+					: await this.movePrimaryAttachmentFile(currentPath, targetPrimaryPath, diagnostics);
+				let replacement = moveResult.path;
 				if (replacement) {
 					await this.updateAttachmentLinkedPath(attachment, replacement);
 					if (existingPrimary && !this.pathsEqual(existingPrimary, currentPath)) {
@@ -4139,6 +6652,15 @@
 					primaryPath = replacement;
 					currentPath = replacement;
 					changed = true;
+				}
+				else {
+					movePending = true;
+					this.queuePendingAttachmentMove(attachment, {
+						sourcePath: currentPath,
+						targetPath: moveResult.targetPath || targetPrimaryPath,
+						preferredCollectionID,
+						lastError: moveResult.error || "附件文件暂时无法移动"
+					});
 				}
 			}
 
@@ -4202,8 +6724,12 @@
 			if (changed && options.save !== false) {
 				this.setAttachmentFileIndex(index);
 			}
+			if (!movePending) {
+				this.clearPendingAttachmentMove(attachment.key);
+			}
 			return {
 				changed,
+				movePending,
 				desiredPathCount: desiredPaths.length,
 				desiredPaths,
 				shortcutPathCount: shortcutPaths.length,
@@ -4224,6 +6750,52 @@
 				return "";
 			}
 			return desiredRecords.find(record => Number(record.collectionID) === preferredCollectionID)?.path || "";
+		},
+
+		getRelocatedPreferredCollectionID(currentPath, fileName, changes) {
+			let root = this.getAttachmentMoveRoot();
+			if (!root || !currentPath || !fileName) {
+				return null;
+			}
+			for (let change of changes || []) {
+				let oldPath = Array.isArray(change?.oldPath) ? change.oldPath.filter(Boolean) : [];
+				if (!oldPath.length) {
+					continue;
+				}
+				let oldFilePath = PathUtils.join(root, ...oldPath, fileName);
+				if (this.pathsEqual(oldFilePath, currentPath)) {
+					return Number(change.collectionID) || null;
+				}
+			}
+			return null;
+		},
+
+		async getRelocatedPathForCollectionPathChanges(currentPath, changes) {
+			let root = this.getAttachmentMoveRoot();
+			if (!root || !currentPath) {
+				return "";
+			}
+			let normalizedCurrent = this.normalizePathForCompare(currentPath);
+			for (let change of changes || []) {
+				let oldPath = Array.isArray(change?.oldPath) ? change.oldPath.filter(Boolean) : [];
+				let newPath = Array.isArray(change?.newPath) ? change.newPath.filter(Boolean) : [];
+				if (!oldPath.length || !newPath.length) {
+					continue;
+				}
+				let oldDir = PathUtils.join(root, ...oldPath);
+				let newDir = PathUtils.join(root, ...newPath);
+				let normalizedOldDir = this.normalizePathForCompare(oldDir);
+				if (!normalizedCurrent || !normalizedOldDir
+					|| !(normalizedCurrent === normalizedOldDir || normalizedCurrent.startsWith(normalizedOldDir + "/"))) {
+					continue;
+				}
+				let relative = currentPath.slice(String(oldDir).length).replace(/^[\\/]+/, "");
+				let candidate = relative ? PathUtils.join(newDir, ...relative.split(/[\\/]+/).filter(Boolean)) : newDir;
+				if (await IOUtils.exists(candidate)) {
+					return candidate;
+				}
+			}
+			return "";
 		},
 
 		getRemovedCollectionShortcutPaths(collectionIDs, fileName) {
@@ -4265,18 +6837,134 @@
 				let uniquePath = await this.getUniqueDestinationPath(desiredPath);
 				if (!uniquePath) {
 					diagnostics.push(`主路径移动失败：目标路径已存在且无法生成唯一文件名：${desiredPath}`);
-					return "";
+					return { path: "", targetPath: desiredPath, error: "目标路径已存在且无法生成唯一文件名" };
 				}
 				desiredPath = uniquePath;
 			}
 			try {
 				await IOUtils.move(sourcePath, desiredPath);
-				return desiredPath;
+				return { path: desiredPath, targetPath: desiredPath, error: "" };
 			}
 			catch (e) {
 				Zotero.logError(e);
 				diagnostics.push(`主路径移动失败：${sourcePath} -> ${desiredPath}；${e.message || e}`);
-				return "";
+				return { path: "", targetPath: desiredPath, error: String(e.message || e) };
+			}
+		},
+
+		getPendingAttachmentMoves() {
+			let raw = this.getPref("pendingAttachmentMoves", "{}");
+			try {
+				let tasks = JSON.parse(raw);
+				return tasks && typeof tasks === "object" && !Array.isArray(tasks) ? tasks : {};
+			}
+			catch (e) {
+				return {};
+			}
+		},
+
+		setPendingAttachmentMoves(tasks) {
+			this.setPref("pendingAttachmentMoves", JSON.stringify(tasks || {}));
+		},
+
+		queuePendingAttachmentMove(attachment, details = {}) {
+			if (!attachment?.key) {
+				return;
+			}
+			let tasks = this.getPendingAttachmentMoves();
+			let previous = tasks[attachment.key] || {};
+			tasks[attachment.key] = {
+				itemID: attachment.id,
+				libraryID: attachment.libraryID,
+				key: attachment.key,
+				sourcePath: details.sourcePath || attachment.getFilePath?.() || previous.sourcePath || "",
+				targetPath: details.targetPath || previous.targetPath || "",
+				preferredCollectionID: Number(details.preferredCollectionID) || previous.preferredCollectionID || null,
+				attempts: Number(previous.attempts || 0) + 1,
+				lastError: details.lastError || previous.lastError || "附件文件暂时无法移动",
+				updatedAt: new Date().toISOString()
+			};
+			this.setPendingAttachmentMoves(tasks);
+			this.schedulePendingAttachmentMoveRetry(15000);
+		},
+
+		clearPendingAttachmentMove(attachmentKey) {
+			if (!attachmentKey) {
+				return;
+			}
+			let tasks = this.getPendingAttachmentMoves();
+			if (!Object.prototype.hasOwnProperty.call(tasks, attachmentKey)) {
+				return;
+			}
+			delete tasks[attachmentKey];
+			this.setPendingAttachmentMoves(tasks);
+		},
+
+		clearPendingAttachmentMoveRetryTimer() {
+			if (this._pendingMoveRetryTimer) {
+				clearTimeout(this._pendingMoveRetryTimer);
+				this._pendingMoveRetryTimer = null;
+			}
+		},
+
+		schedulePendingAttachmentMoveRetry(delay = 15000) {
+			if (!Object.keys(this.getPendingAttachmentMoves()).length) {
+				return;
+			}
+			this.clearPendingAttachmentMoveRetryTimer();
+			this._pendingMoveRetryTimer = setTimeout(() => {
+				this._pendingMoveRetryTimer = null;
+				this.retryPendingAttachmentMoves().catch(e => Zotero.logError(e));
+			}, Math.max(1000, Number(delay) || 15000));
+		},
+
+		async retryPendingAttachmentMoves() {
+			if (this._retryingPendingMoves) {
+				return;
+			}
+			this._retryingPendingMoves = true;
+			let completed = 0;
+			try {
+				let tasks = this.getPendingAttachmentMoves();
+				for (let task of Object.values(tasks)) {
+					let attachment = null;
+					try {
+						attachment = task.itemID ? await Zotero.Items.getAsync(Number(task.itemID)) : null;
+						if (!attachment?.isFileAttachment?.() && task.libraryID && task.key) {
+							attachment = Zotero.Items.getByLibraryAndKey?.(Number(task.libraryID), task.key) || null;
+						}
+						if (!attachment?.isFileAttachment?.()) {
+							this.clearPendingAttachmentMove(task.key);
+							continue;
+						}
+						let result = await this.syncAttachmentMirrors(attachment, {
+							preferredCollectionID: task.preferredCollectionID
+						});
+						if (!result.movePending && result.primaryPath) {
+							completed++;
+						}
+					}
+					catch (e) {
+						Zotero.logError(e);
+						if (attachment) {
+							this.queuePendingAttachmentMove(attachment, {
+								sourcePath: task.sourcePath,
+								targetPath: task.targetPath,
+								preferredCollectionID: task.preferredCollectionID,
+								lastError: String(e.message || e)
+							});
+						}
+					}
+				}
+			}
+			finally {
+				this._retryingPendingMoves = false;
+			}
+			if (completed) {
+				this.showStatus(`ZotLink 已完成 ${completed} 个延后的附件移动`, 3500);
+			}
+			if (Object.keys(this.getPendingAttachmentMoves()).length) {
+				this.schedulePendingAttachmentMoveRetry(15000);
 			}
 		},
 
@@ -4713,16 +7401,45 @@
 		async indexAllLibraryAttachmentFileIDs(options = {}) {
 			let attachments = await this.getAllUserFileAttachments();
 			if (!attachments.length) {
+				let result = { total: 0, indexed: 0, skipped: 0, alreadyIndexed: 0 };
+				if (options.silent) {
+					return result;
+				}
 				if (options.softReport) {
 					this.showSoftReport("个人库中未找到可记录机内码的文件附件", 5000);
 				}
 				else {
 					this.showIndexReport("个人库中未找到可记录机内码的文件附件");
 				}
-				return;
+				return result;
 			}
 
 			let index = this.getAttachmentFileIndex();
+			let totalAttachments = attachments.length;
+			let alreadyIndexed = 0;
+			if (options.onlyMissing) {
+				attachments = attachments.filter(attachment => {
+					let hasFileID = Boolean(index[attachment.key]?.fileID);
+					if (hasFileID) {
+						alreadyIndexed++;
+					}
+					return !hasFileID;
+				});
+			}
+			if (!attachments.length) {
+				let message = `全库附件均已有机内码记录，共 ${alreadyIndexed} 个文件附件，无需补录。`;
+				let result = { total: totalAttachments, indexed: 0, skipped: 0, alreadyIndexed, message };
+				if (options.silent) {
+					return result;
+				}
+				if (options.softReport) {
+					this.showSoftReport(message, 5000);
+				}
+				else {
+					this.showIndexReport(message);
+				}
+				return result;
+			}
 			let indexed = 0;
 			let batchIndexed = 0;
 			let fallbackIndexed = 0;
@@ -4790,8 +7507,12 @@
 			let savedCount = Object.keys(this.getAttachmentFileIndex()).length;
 			let seconds = Math.round((Date.now() - startedAt) / 1000);
 			let reasonText = this.formatReasons(reasons);
-			let message = `全库附件机内码初始化完成：共检查 ${attachments.length} 个文件附件，已记录 ${indexed} 个（批量读取 ${batchIndexed}，单项补读 ${fallbackIndexed}；索引现有 ${savedCount} 条）${skipped ? `，跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。耗时约 ${seconds} 秒。`;
+			let message = `全库附件机内码更新完成：共检查 ${totalAttachments} 个文件附件，原有 ${alreadyIndexed} 个，本次记录 ${indexed} 个（批量读取 ${batchIndexed}，单项补读 ${fallbackIndexed}；索引现有 ${savedCount} 条）${skipped ? `，跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}。耗时约 ${seconds} 秒。`;
 			this.updateProgressWindow(progressWindow, "附件机内码初始化完成", `已记录 ${indexed}，跳过 ${skipped}，耗时约 ${seconds} 秒`, 6000);
+			let result = { total: totalAttachments, indexed, skipped, alreadyIndexed, batchIndexed, fallbackIndexed, savedCount, message };
+			if (options.silent) {
+				return result;
+			}
 			if (options.softReport) {
 				this.setPref("lastIndexReport", message);
 				this.showSoftReport(message, 8000);
@@ -4799,6 +7520,7 @@
 			else {
 				this.showIndexReport(message);
 			}
+			return result;
 		},
 
 		showIndexReport(message) {
@@ -4829,6 +7551,23 @@
 				progressWindow.addDescription(message);
 				if (closeAfter) {
 					progressWindow.startCloseTimer(closeAfter);
+				}
+			}
+			catch (e) {
+				Zotero.logError(e);
+			}
+		},
+
+		closeProgressWindow(progressWindow) {
+			if (!progressWindow) {
+				return;
+			}
+			try {
+				if (typeof progressWindow.close === "function") {
+					progressWindow.close();
+				}
+				else if (typeof progressWindow.startCloseTimer === "function") {
+					progressWindow.startCloseTimer(1);
 				}
 			}
 			catch (e) {
@@ -5566,6 +8305,82 @@ finally:
 			this.showMoveReport(`已修复 ${repaired} 个附件链接${skipped ? `，跳过 ${skipped} 个${reasonText ? "：" + reasonText : ""}` : ""}`);
 		},
 
+		async repairAllLibraryAttachmentLinksByFileID(options = {}) {
+			let root = this.getAttachmentMoveRoot();
+			if (!root || !(await IOUtils.exists(root))) {
+				if (!options.silent) {
+					this.showSoftReport("附件顶层路径不存在，无法检查全库附件链接。", 7000);
+				}
+				return { total: 0, repaired: 0, indexed: 0, outsideRoot: 0, unresolved: 0 };
+			}
+
+			let attachments = await this.getAllUserFileAttachments();
+			let index = this.getAttachmentFileIndex();
+			let indexed = 0;
+			let repaired = 0;
+			let outsideRoot = 0;
+			let unresolved = 0;
+			let reasons = new Map();
+			this._fileIDMapCache = null;
+
+			for (let i = 0; i < attachments.length; i++) {
+				let attachment = attachments[i];
+				try {
+					let record = this.normalizeAttachmentIndexRecord(attachment, index[attachment.key]);
+					if (!record?.fileID) {
+						let result = await this.indexAttachmentFileID(attachment, {
+							quiet: true,
+							index,
+							save: false
+						});
+						if (result.ok) {
+							indexed++;
+							record = this.normalizeAttachmentIndexRecord(attachment, index[attachment.key]);
+						}
+						else {
+							unresolved++;
+							this.countReason(reasons, result.reason || "无法记录机内码");
+							continue;
+						}
+					}
+
+					let result = await this.repairAttachmentLinkByFileID(attachment, {
+						silent: true,
+						index,
+						notifyOutsideRoot: false
+					});
+					if (result.ok) {
+						repaired++;
+					}
+					else if (result.outsideRoot) {
+						outsideRoot++;
+					}
+					else if (!result.current) {
+						unresolved++;
+						this.countReason(reasons, result.reason || "无法定位附件");
+					}
+				}
+				catch (e) {
+					Zotero.logError(e);
+					unresolved++;
+					this.countReason(reasons, e.message || "异常");
+				}
+
+				let processed = i + 1;
+				if (processed === 1 || processed === attachments.length || processed % 10 === 0) {
+					options.onProgress?.({ processed, total: attachments.length });
+				}
+			}
+
+			this.setAttachmentFileIndex(index);
+			let reasonText = this.formatReasons(reasons);
+			let message = `全库附件链接检查完成：共检查 ${attachments.length} 个附件，补录机内码 ${indexed} 个，修复链接 ${repaired} 个，根目录外 ${outsideRoot} 个，无法定位 ${unresolved} 个${reasonText ? "：" + reasonText : ""}。`;
+			if (!options.silent) {
+				this.showSoftReport(message, 10000);
+			}
+			return { total: attachments.length, repaired, indexed, outsideRoot, unresolved, message };
+		},
+
 		async repairAttachmentLinkByFileID(attachment, options = {}) {
 			let root = this.getAttachmentMoveRoot();
 			if (!root || !(await IOUtils.exists(root))) {
@@ -5576,7 +8391,8 @@ finally:
 				return { ok: false, reason: "不是文件附件" };
 			}
 
-			let record = this.normalizeAttachmentIndexRecord(attachment, this.getAttachmentFileIndex()[attachment.key]);
+			let index = options.index || this.getAttachmentFileIndex();
+			let record = this.normalizeAttachmentIndexRecord(attachment, index[attachment.key]);
 			if (!record?.fileID) {
 				return { ok: false, reason: "没有已记录机内码" };
 			}
@@ -5586,22 +8402,113 @@ finally:
 			if (currentPath && await IOUtils.exists(currentPath)) {
 				let currentLocator = await this.getWindowsFileID(currentPath, { quiet: true });
 				if (currentLocator.fileID && this.fileIDsEqual(currentLocator.fileID, fileID)) {
-					return { ok: false, reason: "当前链接未丢失" };
+					if (!this.isPathInsideRoot(currentPath, root)) {
+						if (options.notifyOutsideRoot) {
+							this.showStatus(`附件已移出 ZotLink 顶层路径：${currentPath}`, 9000);
+						}
+						return { ok: false, current: true, outsideRoot: true, path: currentPath, reason: "附件位于顶层路径外" };
+					}
+					if (!this.pathsEqual(record.primaryPath, currentPath)) {
+						this.updateAttachmentFileIndexPath(attachment, record, currentPath, index, !options.index);
+					}
+					await this.syncItemCollectionFromAttachmentPath(attachment, currentPath, root);
+					return { ok: false, current: true, reason: "当前链接未丢失" };
 				}
 			}
 
 			let foundPath = await this.findFileByRecordedID(fileID, root, record, options);
 			if (!foundPath) {
-				return { ok: false, reason: "未在顶层目录找到匹配文件" };
+				foundPath = await this.findFileOutsideRootByRecordedID(fileID, record);
+			}
+			if (!foundPath) {
+				return { ok: false, reason: "未找到匹配机内码的文件" };
+			}
+			if (!this.isPathInsideRoot(foundPath, root)) {
+				if (options.notifyOutsideRoot) {
+					this.showStatus(`附件已移出 ZotLink 顶层路径：${foundPath}`, 9000);
+				}
+				return { ok: false, outsideRoot: true, path: foundPath, reason: "附件位于顶层路径外" };
 			}
 
 			await this.updateAttachmentLinkedPath(attachment, foundPath);
-			this.updateAttachmentFileIndexPath(attachment, record, foundPath);
+			this.updateAttachmentFileIndexPath(attachment, record, foundPath, index, !options.index);
+			let collectionID = await this.syncItemCollectionFromAttachmentPath(attachment, foundPath, root);
+			await this.syncAttachmentMirrors(attachment, {
+				index,
+				save: false,
+				preferredCollectionID: collectionID || undefined
+			});
+			if (!options.index) {
+				this.setAttachmentFileIndex(index);
+			}
 			Zotero.getActiveZoteroPane()?.itemsView?.refreshAndMaintainSelection?.();
 			if (!options.silent) {
 				this.showStatus("已自动修复附件链接");
 			}
 			return { ok: true, path: foundPath };
+		},
+
+		isPathInsideRoot(path, root) {
+			let normalizedPath = this.normalizePathForCompare(path);
+			let normalizedRoot = this.normalizePathForCompare(root);
+			return Boolean(normalizedPath && normalizedRoot
+				&& (normalizedPath === normalizedRoot || normalizedPath.startsWith(normalizedRoot + "/")));
+		},
+
+		async syncItemCollectionFromAttachmentPath(attachment, path, root) {
+			if (!this.isPathInsideRoot(path, root)) {
+				return null;
+			}
+			let parent = attachment?.parentItem;
+			if (!parent?.isRegularItem?.()) {
+				return null;
+			}
+			let normalizedRoot = String(root || "").replace(/[\\/]+$/g, "");
+			let parentPath = this.getParentPath(path);
+			let relative = parentPath.slice(normalizedRoot.length).replace(/^[\\/]+/, "");
+			let segments = relative.split(/[\\/]+/).map(value => value.trim()).filter(Boolean);
+			if (!segments.length) {
+				return null;
+			}
+			let collectionID = await this.ensureCollectionPath(null, segments, new Map([["", null]]), new Map());
+			if (!collectionID) {
+				return null;
+			}
+			let existing = new Set((parent.getCollections?.() || []).map(Number));
+			if (!existing.has(Number(collectionID))) {
+				parent.addToCollection(collectionID);
+				await parent.saveTx();
+			}
+			return Number(collectionID);
+		},
+
+		async findFileOutsideRootByRecordedID(fileID, record) {
+			let idParts = this.normalizeFileIDForCompare(fileID).split(":").filter(Boolean);
+			let nativeFileID = idParts[idParts.length - 1] || "";
+			if (!nativeFileID) {
+				return "";
+			}
+			let drives = new Set();
+			for (let path of [record?.primaryPath, record?.path, ...(record?.shortcutPaths || []), ...(record?.hardlinkPaths || [])]) {
+				let match = String(path || "").match(/^([a-z]:)/i);
+				if (match) {
+					drives.add(match[1].toUpperCase());
+				}
+			}
+			for (let drive of drives) {
+				let result = await this.execDiagnosticCommand("C:\\Windows\\System32\\fsutil.exe", [
+					"file",
+					"queryFileNameById",
+					drive,
+					nativeFileID
+				]);
+				let match = String(result.text || "").match(/(?:\\\\\?\\)?([A-Z]:\\[^\r\n]+)/i);
+				let path = match ? match[1].trim() : "";
+				if (path && await IOUtils.exists(path)) {
+					return path;
+				}
+			}
+			return "";
 		},
 
 		async findFileByRecordedID(fileID, root, record, options = {}) {
@@ -5629,8 +8536,8 @@ finally:
 			return "";
 		},
 
-		updateAttachmentFileIndexPath(attachment, record, path) {
-			let index = this.getAttachmentFileIndex();
+		updateAttachmentFileIndexPath(attachment, record, path, index = null, save = true) {
+			index = index || this.getAttachmentFileIndex();
 			record = this.normalizeAttachmentIndexRecord(attachment, record);
 			index[attachment.key] = {
 				...record,
@@ -5643,7 +8550,9 @@ finally:
 				fileName: PathUtils.filename(path),
 				updatedAt: new Date().toISOString()
 			};
-			this.setAttachmentFileIndex(index);
+			if (save) {
+				this.setAttachmentFileIndex(index);
+			}
 		},
 
 		getParentPath(path) {

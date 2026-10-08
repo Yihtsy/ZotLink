@@ -32,9 +32,11 @@
 			</vbox>
 
 			<vbox style="margin-bottom: 18px;">
-				<label value="文件操作时自动处理"/>
+				<label value="文件操作与全库更新项目"/>
 				<checkbox id="zotlink-auto-write-doi-metadata"
 				          label="写入 PDF DOI 与 DOI URL 元数据"/>
+				<checkbox id="zotlink-auto-rename-new-attachments"
+				          label="首次导入时按引用信息重命名主 PDF（仅首次导入）"/>
 				<checkbox id="zotlink-auto-align-page-labels"
 				          label="对齐主 PDF 页码标签"/>
 				<checkbox id="zotlink-auto-set-open-first-page"
@@ -43,29 +45,48 @@
 				          label="将 PDF 显示标题设置为文件名"/>
 				<checkbox id="zotlink-auto-extract-article-history"
 				          label="识别英文期刊文章投稿历史并写入 Extra"/>
+				<checkbox id="zotlink-use-alert-for-collection-import-completion"
+				          label="Collection 导入完成后使用确认弹窗（默认使用右下角软弹窗）"/>
 			</vbox>
 
 			<vbox>
 				<hbox style="margin-bottom: 8px;">
-					<button id="zotlink-index-all-attachments"
-					        label="初始化全库附件机内码"
-					        oncommand="Zotero.ZotLink.handlePreferenceAction('indexAllAttachments', this);"/>
+					<button id="zotlink-repair-all-library-links"
+					        label="检查并修复全库附件链接"
+					        oncommand="Zotero.ZotLink.handlePreferenceAction('repairAllLibraryLinks', this);"/>
 				</hbox>
 				<hbox style="margin-bottom: 8px;">
-					<button id="zotlink-write-all-pdf-doi-metadata"
-					        label="写入全库 PDF DOI 元数据并对齐页码"
-					        oncommand="Zotero.ZotLink.handlePreferenceAction('writeAllPDFDOIMetadata', this);"/>
-				</hbox>
-				<hbox style="margin-bottom: 8px;">
-					<button id="zotlink-write-all-article-history"
-					        label="提取全库文章历史时间线"
-					        oncommand="Zotero.ZotLink.handlePreferenceAction('writeAllArticleHistory', this);"/>
+					<button id="zotlink-update-all-library"
+					        label="按勾选项目更新全库"
+					        oncommand="Zotero.ZotLink.handlePreferenceAction('updateAllLibrary', this);"/>
 				</hbox>
 				<hbox>
 					<button id="zotlink-import-root-pdf-library"
 					        label="从顶层文件夹重建链接库"
 					        oncommand="Zotero.ZotLink.handlePreferenceAction('importRootPDFLibrary', this);"/>
 				</hbox>
+			</vbox>
+
+			<separator style="margin: 20px 0 12px 0;"/>
+			<vbox>
+				<label><html:h3 style="margin: 0 0 8px 0;">快速复制文献链接</html:h3></label>
+				<label value="复制 DOI/URL 链接快捷键"/>
+				<html:input id="zotlink-copy-link-shortcut"
+				            style="width: 240px; max-width: 100%; box-sizing: border-box; margin-top: 4px;"
+				            placeholder="点击后按快捷键，如 Ctrl+Alt+C"
+				            onkeydown="Zotero.ZotLink.captureShortcutInput(event, this);"/>
+				<label id="zotlink-current-copy-link-shortcut"
+				       value=""
+				       style="margin-top: 4px;"/>
+				<label value="复制 Obsidian 文献链接快捷键"
+				       style="margin-top: 12px;"/>
+				<html:input id="zotlink-copy-obsidian-link-shortcut"
+				            style="width: 240px; max-width: 100%; box-sizing: border-box; margin-top: 4px;"
+				            placeholder="点击后按快捷键，如 Ctrl+Alt+B"
+				            onkeydown="Zotero.ZotLink.captureShortcutInput(event, this);"/>
+				<label id="zotlink-current-copy-obsidian-link-shortcut"
+				       value=""
+				       style="margin-top: 4px;"/>
 			</vbox>
 		</vbox>
 	</groupbox>
