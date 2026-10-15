@@ -32,7 +32,7 @@
 			</vbox>
 
 			<vbox style="margin-bottom: 18px;">
-				<label value="文件操作与全库更新项目"/>
+				<label><html:h3>单文件自动处理</html:h3></label>
 				<checkbox id="zotlink-auto-write-doi-metadata"
 				          label="写入 PDF DOI 与 DOI URL 元数据"/>
 				<checkbox id="zotlink-auto-rename-new-attachments"
@@ -43,27 +43,28 @@
 				          label="将 PDF 打开页面设置为首页"/>
 				<checkbox id="zotlink-auto-display-title-filename"
 				          label="将 PDF 显示标题设置为文件名"/>
-				<checkbox id="zotlink-auto-extract-article-history"
-				          label="识别英文期刊文章投稿历史并写入 Extra"/>
 				<checkbox id="zotlink-use-alert-for-collection-import-completion"
 				          label="Collection 导入完成后使用确认弹窗（默认使用右下角软弹窗）"/>
 			</vbox>
 
 			<vbox>
-				<hbox style="margin-bottom: 8px;">
+				<label><html:h3>全库更新项目</html:h3></label>
+				<hbox style="margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 6px;">
+					<button id="zotlink-import-root-pdf-library"
+					        label="从顶层文件夹重建链接库"
+					        oncommand="Zotero.ZotLink.handlePreferenceAction('importRootPDFLibrary', this);"/>
 					<button id="zotlink-repair-all-library-links"
 					        label="检查并修复全库附件链接"
 					        oncommand="Zotero.ZotLink.handlePreferenceAction('repairAllLibraryLinks', this);"/>
 				</hbox>
+				<checkbox id="zotlink-bulk-write-doi-metadata" label="写入 PDF DOI 与 DOI URL 元数据"/>
+				<checkbox id="zotlink-bulk-align-page-labels" label="对齐主 PDF 页码标签（默认关闭）"/>
+				<checkbox id="zotlink-bulk-set-open-first-page" label="将 PDF 打开页面设置为首页（默认关闭）"/>
+				<checkbox id="zotlink-bulk-display-title-filename" label="将 PDF 显示标题设置为文件名（默认关闭）"/>
 				<hbox style="margin-bottom: 8px;">
 					<button id="zotlink-update-all-library"
 					        label="按勾选项目更新全库"
 					        oncommand="Zotero.ZotLink.handlePreferenceAction('updateAllLibrary', this);"/>
-				</hbox>
-				<hbox>
-					<button id="zotlink-import-root-pdf-library"
-					        label="从顶层文件夹重建链接库"
-					        oncommand="Zotero.ZotLink.handlePreferenceAction('importRootPDFLibrary', this);"/>
 				</hbox>
 			</vbox>
 

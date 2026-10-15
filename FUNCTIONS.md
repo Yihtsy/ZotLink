@@ -1,8 +1,19 @@
 # ZotLink 功能细化
 
+适用版本：`0.8.0`
+
 开发中的 Zotero 状态冲突、回收站残留、跨分类重复条目和 UI 刷新问题，统一记录在 `DEVELOPMENT_NOTES.md`。
 
-## 目标
+## Windows PDF 右键工具
+
+- PDF 文件右键 ZotLink 子菜单：Update DOI metadata only、Rename article/book、Align PDF page labels。
+- 三项命令关闭 Zotero 后仍可运行，批量调用合并排队并用自动消失的非模态软提示汇报；命名已一致时不重命名。页码对齐也负责 DOI 元数据补写，用出版社特征及最多前后各 3 页的线索定位正文，不遍历中间页文字。
+- XPI 加载时注册当前用户菜单并释放独立 Python 助手；禁用或卸载清理；无需 pydfdoi，保留 Python 及 pikepdf、pypdf、requests 依赖。
+- DOI 元数据存在时禁止页面覆盖，只有缺失 /doi 才扫描前 20 页；doiURL 始终按 doi 补全或修正。
+- 引用式命名保留原作者/编者、出版社年份、书籍版本和 280 字符路径策略。页码只处理具有常规页码范围的篇章，额外前置第一页为 cover page。
+- 功能入口、限制和行为详见 USER_MANUAL.md 的 I1-I4。
+
+## 附件管理目标
 
 ZotLink 负责 Zotero 链接附件的移动、机内码记录、collection 镜像和链接修复，不处理文献类型或自定义字段。
 
@@ -45,6 +56,7 @@ extensions.zotlink.attachmentFileIndex
 - 一个 Zotero 附件条目仍然只绑定一个真实主路径。
 - 如果父文献属于多个 collections，其他 collection 目录下创建 `.lnk` 快捷方式。
 - 快捷方式文件名使用真实文件名加 `.lnk`，例如 `paper.pdf.lnk`。
+- 自动同步实际新增分身后，显示一条 ZotLink 软通知，说明多分类归属及新增数量；已存在分身的重复检查不通知。
 - 如果父文献移出某个 collection，ZotLink 会删除对应 `.lnk`。
 - 如果 Shift+拖拽导致主路径所在 collection 被移除，ZotLink 会把真实文件移动到新增 collection 对应目录，并更新 Zotero 附件路径。
 - 文件名同步以 Zotero 当前主路径文件名为准；同步流程会重新生成匹配当前主路径的 `.lnk`。
@@ -71,7 +83,14 @@ extensions.zotlink.attachmentFileIndex
 
 - 普通拖拽条目到另一个 collection：ZotLink 保留真实主路径，并为新增 collection 创建 `.lnk`。
 - Shift+拖拽条目到另一个 collection：ZotLink 将真实文件移动到新增 collection 对应目录，并刷新其他 `.lnk`。
+- `collection-item` 通知优先按 `<collectionID>-<itemID>` 解析，同时保留旧版对其他通知参数形式的宽容提取；右侧 `文库和分类` 触发的条目 `modify` 通知也会识别 `changed.collections`。
+- 同时包装 Zotero `Item.setCollections()` 作为直接触发保障；分类数组发生真实变化时记录父条目 ID，等待保存后从数据库读取最终归属并同步 `.lnk`。
+- 为 `setCollections()`、Zotero notifier 与条目拖拽分别记录触发来源；数据库最终分类数、目标路径及分身结果静默写入 `zotlink-membership-diagnostic-latest.txt`。`0.6.0` 起移除临时诊断软弹窗，保留正常操作提示。
+- 拖拽完成后等待约 1.5 秒，再从 `collectionItems` 和分类数据库快照读取最新归属与路径，避免 `item.getCollections()` 缓存尚未刷新而漏建 `.lnk`。
+- `dragstart` 会记录本次来源是分类还是条目；分类 drop 只处理文件夹迁移，条目 drop 只处理分类归属与 `.lnk`，两者不会交叉触发。
+- 分类变化任务使用最早截止时间执行；后续普通条目通知只能合并待处理条目，不能把已经排定的快捷方式同步继续向后推迟。
 - 拖拽结束后使用短状态提示或 debug 日志记录变化，不再弹出确认对话框。
+- 分类内联重命名时，在 Zotero 提交新名称前递归记录完整分类树旧路径；保存完成后移动或合并对应磁盘目录，并重建下属附件链接与快捷方式。分类 `move` 通知也纳入相同流程。
 
 ## 从 Collection 文件夹导入 PDF
 
@@ -88,6 +107,13 @@ extensions.zotlink.attachmentFileIndex
 - 如果 DOI 查询失败，退回到只包含 DOI 和文件名标题的基础条目。
 - 将 PDF 作为链接附件添加到该条目。
 - 创建附件后立即记录机内码。
+
+## 打开分类目录
+
+- 左侧分类右键菜单第二组在原生 `重命名` 后提供 `打开分类目录`，不放在 `ZotLink` 子菜单中。
+- 按设置的附件顶层路径和分类层级计算 Windows 目录。
+- 目录不存在时递归创建，然后调用 Zotero 的系统文件打开接口进入该目录。
+- 菜单项只在单选普通分类时显示，并复用 Zotero “打开文件目录”的图标样式。
 
 ## 从顶层文件夹重建链接库
 
@@ -129,7 +155,19 @@ extensions.zotlink.attachmentFileIndex
 - 搜索优先从原记录目录、快捷方式目录开始，再回退到设置中的附件顶层路径。
 - 找到同机内码真实文件后，更新 Zotero 链接附件路径和附件标题。
 
+## 独立 Windows PDF 右键工作流
+
+- XPI 加载后注册 PDF 右键 ZotLink 菜单，禁用或卸载清理；已注册后关闭 Zotero 仍可使用。
+- 更新 DOI 元数据、引用式重命名、对齐 PDF 页面标签；无需预先导入文献。
+- 重命名和页码对齐查询 Crossref，需联网；仅写入本地 DOI 可离线完成。
+- 连接 5 秒、读取 20 秒超时，不自动重试；网络异常中文软提示，单文件失败后继续批处理。
+
 ## 设置
+
+- 单文件自动处理与全库更新项目独立保存，单文件勾选不再决定全库操作。
+- 单文件保留原默认值；全库默认仅勾选 DOI 元数据，页码及查看设置默认关闭。
+- 全库区域首行左侧“从顶层文件夹重建链接库”、右侧“检查并修复全库附件链接”；下方为独立勾选项目及更新按钮。
+- 投稿历史的实现、字段、设置与右键入口由 ZotFields（原 Zotero Literature Fields）独立提供，ZotLink 不再处理。
 
 - `attachmentMoveRoot`：附件移动和修复扫描的顶层路径。
 - `attachmentMoveShortcut`：移动附件快捷键。

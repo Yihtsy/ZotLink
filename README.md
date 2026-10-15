@@ -1,6 +1,6 @@
 # ZotLink
 
-[![release](https://img.shields.io/badge/release-v0.4.0-blue)](https://github.com/Yihtsy/ZotLink/releases/tag/v0.4.0)
+[![release](https://img.shields.io/badge/release-v0.8.0-blue)](https://github.com/Yihtsy/ZotLink/releases/tag/v0.8.0)
 [![license](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
 [![Zotero](https://img.shields.io/badge/Zotero-10-red)](https://www.zotero.org/)
 
@@ -54,17 +54,17 @@ Inspired by Obsidian's file-first philosophy, ZotLink follows one guiding princi
 - Align PDF page labels from Zotero item page ranges such as `10-18` or `S10-S18`.
 - 支持根据 Zotero 条目的常规页码范围（如 `10-18`、`S10-S18`）对齐 PDF 页码标签。
 
-- Extract journal article history dates from the primary PDF and write `Received:`, `Revised:`, `Accepted:`, and `Online:` lines into Zotero Extra.
-- 支持从期刊文章主 PDF 中提取文章历史时间线，并写入 Zotero Extra 中的 `Received:`、`Revised:`、`Accepted:`、`Online:` 字段行。
+- Register standalone Windows PDF context commands for DOI metadata, citation renaming and page labels; these work after Zotero is closed. Folder context navigation and structure-only subcollection rebuilding connect the file system to Zotero collections.
+- 自动注册 Windows PDF 右键命令，用于 DOI 元数据、引用式改名和页码标签，Zotero 关闭后仍可使用；文件夹右键定位和仅重建子分类结构功能连接普通文件体系与 Zotero 分类。
 
 - Copy the selected literature item's DOI URL with one context-menu command or a configurable shortcut, falling back to the item URL only when no DOI is available.
 - 可通过右键命令或自定义快捷键复制所选文献的 DOI URL；仅在没有 DOI 时回退复制条目 URL。
 
 ## Basic Usage 使用方式
 
-Install `zotlink-0.4.0.xpi` in Zotero, restart Zotero, and set the attachment root folder in ZotLink preferences, for example `D:\OneDrive\Zotero`.
+Install `zotlink-0.8.0.xpi` in Zotero, restart Zotero, and set the attachment root folder in ZotLink preferences, for example `D:\OneDrive\Zotero`.
 
-在 Zotero 插件管理器中安装 `zotlink-0.4.0.xpi`，重启 Zotero，然后在 ZotLink 设置中填写附件顶层路径，例如 `D:\OneDrive\Zotero`。
+在 Zotero 插件管理器中安装 `zotlink-0.8.0.xpi`，重启 Zotero，然后在 ZotLink 设置中填写附件顶层路径，例如 `D:\OneDrive\Zotero`。
 
 Select Zotero items or attachments and use `ZotLink -> Move Attachments to Collection Folder` from the item context menu.
 
@@ -74,21 +74,29 @@ Drag an item normally into another collection to keep the real PDF where it is a
 
 普通拖拽条目到另一个分类时，真实 PDF 保持在原位置，并在新增分类文件夹中创建快捷方式分身。Shift+拖拽时，真实 PDF 会移动到新分类文件夹，原文件夹位置会变成快捷方式分身。
 
-ZotLink preferences include instant checkboxes for automatic PDF processing during file operations. DOI/DOI URL metadata writing, page-label alignment, opening PDFs at the first page, and making PDF viewers show the filename are enabled by default. First-import citation renaming and article history extraction are disabled by default.
+ZotLink preferences separate single-file automatic processing from whole-library updates, with independently saved checkboxes. Single-file DOI metadata, page-label alignment and viewer preferences remain enabled by default; first-import citation renaming is off. Whole-library updates enable only DOI metadata by default; page-label and viewer changes are off to limit unnecessary bulk processing.
 
-ZotLink 设置中提供文件操作自动处理勾选项，勾选后即时生效。DOI/DOI URL 元数据写入、页码标签对齐、打开 PDF 时定位首页、让 PDF 查看器显示文件名默认开启；首次导入自动改名与文章投稿历史识别默认关闭。
+ZotLink 设置分为“单文件自动处理”和“全库更新项目”，两组勾选独立保存、即时生效。单文件的 DOI 元数据、页码对齐和查看设置默认开启，首次导入改名默认关闭。全库默认仅开启 DOI 元数据，页码及查看设置默认关闭，以减少不必要的批量处理。
 
-The `Update Entire Library Using Selected Options` button combines whole-library maintenance according to the checked options: filling missing file IDs, writing DOI metadata, aligning page labels, applying PDF viewer preferences, and extracting article history. First-import citation renaming remains limited to newly imported files. Rebuilding from the root folder remains a separate operation because it may create collections and Zotero items.
+The first row of the whole-library section places rebuilding the linked library from the root on the left and checking/repairing all attachment links on the right. Bulk PDF updates use the independent checkboxes below. First-import renaming remains a single-file operation. Article history extraction, its date fields, settings and actions now belong entirely to ZotFields (formerly Zotero Literature Fields); existing Extra dates are preserved.
 
-`按勾选项目更新全库`按钮会按照当前勾选项组合执行全库维护，包括补录缺失机内码、写入 DOI 元数据、对齐页码、更新 PDF 查看设置和提取文章历史。引用式改名仍然只用于首次导入。由于顶层文件夹重建可能创建分类和 Zotero 条目，因此继续作为独立操作保留。
+全库区域第一行左侧为“从顶层文件夹重建链接库”，右侧为“检查并修复全库附件链接”，下方使用独立勾选项更新 PDF。首次导入改名仍仅用于单文件。文章投稿历史提取、四个日期字段、设置和操作入口已完整迁移至 ZotFields（原 Zotero Literature Fields），已有 Extra 日期保留不变。
 
 ## Features 功能介绍
 
 ### Multi-Collection Shortcut Mirrors 多重分类与快捷方式分身
 
+Renaming a collection also renames its mapped folder and updates attachment links. Shortcut mirrors preserve filenames containing straight or typographic apostrophes.
+
+修改分类名称时，对应文件夹同步改名并更新附件链接。快捷方式分身支持含普通单引号或英文弯引号的文件名，保留原始名称。
+
 Zotero binds one attachment item to one real file path, but one literature item may belong to multiple collections. ZotLink solves this by keeping a single real PDF and creating `.lnk` shortcut mirrors for the other collection folders.
 
 Zotero 的一个附件条目只能绑定一个真实文件路径，但一个文献条目常常同时属于多个分类。ZotLink 的做法是保留一份真实 PDF，并为其他分类文件夹创建 `.lnk` 快捷方式分身。
+
+Think of this as the body-and-double swap of Yuan'ge or Kongkong'er in Honor of Kings: the real PDF is the body, shortcuts are its doubles, and swapping relocates the body while keeping the other entrances pointing to it. There is still only one real PDF, not multiple independent copies.
+
+可以类比《王者荣耀》中元歌或空空儿的本体与分身换位：真实 PDF 是本体，快捷方式是分身；换位时移动本体，并让其他入口继续指向它。真实文件始终只有一份，而不是多份独立副本。
 
 ZotLink considered hard links, but did not choose them as the default strategy. Hard links can make the primary path unclear, are not always friendly in ordinary file managers or sync tools, and can make deletion semantics confusing. `.lnk` shortcuts make the model explicit: one real PDF, multiple visible entrances.
 
@@ -107,6 +115,48 @@ If a same-named destination folder already exists, ZotLink moves and merges the 
 Moves blocked by an open PDF are kept in a persistent retry queue. ZotLink retries after the file is closed and continues unfinished moves after Zotero restarts.
 
 如果 PDF 正在打开而暂时无法移动，任务会进入持久重试队列；文件关闭后自动重试，重启 Zotero 后也会继续完成。
+
+### Windows Folder Navigation Windows 文件夹右键定位
+
+Installing and loading the ZotLink XPI automatically registers `定位到 Zotero 分类` (Locate in Zotero) in the Windows folder context menu. Choose it to select and focus the matching Zotero collection. Missing collections are created along the relative folder path; choosing the attachment root itself selects My Library. No literature is imported.
+
+安装并加载 ZotLink XPI 后，自动注册 Windows 文件夹右键菜单 `定位到 Zotero 分类`。点击后选中对应分类并聚焦 Zotero；缺失分类会按文件夹的相对路径逐级创建。右键附件根目录本身时定位到“我的文库”，不会导入文献。
+
+The command appears only for the attachment root configured in ZotLink preferences and its subfolders. Changing that setting updates the Windows visibility condition. This condition remains active when Zotero is closed, but using the command then displays a Windows prompt to open Zotero. Disabling or uninstalling ZotLink removes its menu and helper files.
+
+菜单仅在 ZotLink 设置中的附件根目录及其子文件夹内显示，根目录外隐藏。修改根目录设置后同步更新显示范围；Zotero 关闭时仍能判断是否显示，但点击时会提示先启动 Zotero。禁用或卸载 ZotLink 会移除其菜单和助手文件。
+
+### Structure-Only Rebuild 仅根据本地文件夹重建子分类结构（不导入PDF）
+
+Choose the second command in a collection's ZotLink submenu: `仅根据本地文件夹重建子分类结构（不导入PDF）` (Rebuild Subcollections from Local Folders Only (No PDF Import)). It first creates missing folders for the selected collection and its descendants, then creates missing subcollections for disk subfolders. Existing same-named collections under the same parent are reused. It does not read PDF metadata, import literature, attach files, or move existing files.
+
+分类右键 ZotLink 子菜单第二项 `仅根据本地文件夹重建子分类结构（不导入PDF）`，先为当前分类及全部子分类补建缺失文件夹，再为磁盘子文件夹补建缺失子分类；同一父分类下复用已有同名分类。它不读取 PDF 元数据、不导入文献、不添加附件，也不移动已有文件。
+
+A ZotLink soft notification marks the start and closes when the task ends. A confirmation dialog reports the numbers of folders and subcollections created and the elapsed time. See manual entries E8 and E9 for these two features.
+
+开始时显示 ZotLink 软提示，任务结束立即关闭；完成时用硬弹窗汇报新增文件夹、子分类数量和耗时。这两项功能详见手册 E8、E9。
+
+### Standalone Windows PDF Tools 独立 Windows PDF 右键工具
+
+Work on PDFs directly in File Explorer, without importing them into Zotero or keeping Zotero open. Together with folder-to-collection navigation, the registered context menus extend ZotLink's file-first workflow beyond Zotero.
+
+直接在资源管理器中处理 PDF，无需先导入 Zotero，也无需保持 Zotero 开启。结合文件夹右键定位分类，自动注册的右键工具将 ZotLink 的文件优先工作流延伸到 Zotero 之外。
+
+Installing and loading the XPI also registers a `ZotLink` submenu for PDF files: `Update DOI metadata only`, `Rename article/book`, and `Align PDF page labels`. These commands run independently of Zotero using bundled Python source. They require Python with its Windows launcher and the packages `pikepdf`, `pypdf`, and `requests`; no pydfdoi installation is needed. Disabling or uninstalling ZotLink removes its menu and helpers.
+
+安装并加载 XPI 后，还会为 PDF 文件注册 `ZotLink` 子菜单：`Update DOI metadata only`、`Rename article/book`、`Align PDF page labels`。命令使用随插件打包的独立 Python 代码，可在 Zotero 关闭时运行；需要带 Windows 启动器的 Python 及 `pikepdf`、`pypdf`、`requests`，无需安装 pydfdoi。禁用或卸载插件时移除自有菜单和助手。
+
+An existing PDF `/doi` is authoritative and is never replaced by rescanning pages. Only a missing `/doi` triggers text extraction from the first 20 pages, without OCR. `doiURL` is derived from the DOI and corrected when inconsistent. Rename retains the citation-based author/editor, year, title and subtitle rules. Align PDF page labels accepts conventional Crossref page ranges for journal articles, proceedings papers and chapters, skips whole books and article numbers, and labels an extra leading cover page `cover page`. See manual I1-I4.
+
+已有 PDF `/doi` 始终优先，不会重新扫描页面来覆盖；只有缺少该字段时才读取前 20 页文字，不执行 OCR。`doiURL` 以 doi 为准补全或修正。改名沿用作者/编者、年份、主副标题的引用式规则；页码对齐支持有常规 Crossref 页码范围的期刊文章、会议论文和书籍章节，跳过整本书或文章号，额外前置封面的标签为小写 `cover page`。详见手册 I1-I4。
+
+Install the Python dependencies with `py -3 -m pip install pikepdf pypdf requests`.
+
+Python 依赖安装命令：`py -3 -m pip install pikepdf pypdf requests`。
+
+The three PDF tools remain available when Zotero is closed. Nearby batch invocations are queued and summarized in an auto-closing, non-modal ZotLink notice. A filename already matching the citation target is left unchanged and reported as such. Align PDF page labels also writes or repairs DOI metadata. It locates the first content page using publisher-specific clues, the Crossref title and page range, and text from at most three leading and three trailing pages, without extracting middle-page text.
+
+三个 PDF 工具在 Zotero 关闭后仍可使用。相近时间的批量调用会排队并合并为自动关闭的 ZotLink 软提示，无需逐个点击确定。文件名已符合引用目标时直接跳过改名并明确说明。页码对齐也会补写或修正 DOI 元数据；正文第一页通过出版社特征、Crossref 标题及页码范围，以及最多前 3 页和后 3 页的文字定位，不提取中间页面文字。
 
 ### Root Folder Library Rebuild 顶层文件夹重建链接库
 
@@ -139,6 +189,12 @@ Collection-folder imports first try a fast Windows file-ID match against ZotLink
 ZotLink reads DOI values from PDF Info/XMP metadata fields such as `doi`, `DOI`, `prism:doi`, and `dc:identifier`. If no DOI is found, it reads ISBN metadata fields such as `isbn`, `ISBN`, `prism:isbn`, and `dc:identifier`, normalizes hyphenated ISBN-13, plain ISBN-13, and ISBN-10 values, and then uses Zotero's native identifier-search path to create full Zotero items. PDFs without DOI or ISBN metadata fields are skipped quickly.
 
 ZotLink 会读取 PDF Info/XMP metadata 中的 `doi`、`DOI`、`prism:doi`、`dc:identifier` 等 DOI 字段；如果没有 DOI，则继续读取 `isbn`、`ISBN`、`prism:isbn`、`dc:identifier` 等 ISBN 字段，并预处理带连字符的 ISBN-13、纯 13 位 ISBN 和 ISBN-10，再走 Zotero 原生标识符搜索路径创建完整条目。没有 DOI 或 ISBN metadata 字段的 PDF 会快速跳过。
+
+### Open Collection Folder 打开分类目录
+
+Right-click a collection and choose `Open Collection Folder`, placed beside Zotero's native `Rename` command. ZotLink opens the matching folder under the configured attachment root; if the folder does not yet exist, ZotLink creates the complete directory path first. This command is intentionally placed in the main collection context menu rather than inside the ZotLink submenu.
+
+右键单击分类并选择位于 Zotero 原生“重命名”旁边的 `打开分类目录`，即可打开附件顶层路径下与该分类层级对应的文件夹。如果目录尚不存在，ZotLink 会先创建完整目录路径。这个命令直接位于分类主右键菜单中，不放在 ZotLink 子菜单内。
 
 ### PDF DOI Metadata and Page Labels PDF DOI 元数据与页码标签
 
@@ -182,25 +238,21 @@ This is intended for fast linking in Obsidian and similar note-taking applicatio
 
 这一功能主要用于在 Obsidian 等笔记软件中快速插入文献链接：在笔记中拖选已有文字，通过 ZotLink 快捷键复制文献链接，返回笔记后粘贴，即可利用笔记软件原有的粘贴行为把所选文字转换为链接。
 
-### Article History Fields 文章历史时间线字段
-
-For English journal article items, ZotLink can read the primary PDF and extract article history dates such as received, revised, accepted, and online publication dates. The results are written into Zotero Extra as `Received: YYYY-MM-DD`, `Revised: YYYY-MM-DD`, `Accepted: YYYY-MM-DD`, and `Online: YYYY-MM-DD`, and ZotLink also exposes them as dedicated item-info rows when Zotero supports custom info rows.
-
-对于英文期刊文章条目，ZotLink 可以读取主 PDF，提取收稿、修订、录用和在线发表等文章历史时间线，并以 `Received: YYYY-MM-DD`、`Revised: YYYY-MM-DD`、`Accepted: YYYY-MM-DD`、`Online: YYYY-MM-DD` 的形式写入 Zotero Extra；在 Zotero 支持自定义信息栏字段时，ZotLink 也会把它们显示为独立信息栏行。
-
-The extractor checks the first four and last four PDF pages. Existing history fields are treated as user-corrected values and are never overwritten; automatic extraction only fills fields that are still missing.
-
-提取器会检查 PDF 的前四页与后四页。已有文章历史字段视为用户确认或修正过的值，自动识别绝不覆盖，只补充仍然缺失的字段。
-
 ### Planned Crossref Metadata Repair 计划中的 Crossref 元数据修复
 
 ZotLink plans to absorb the part of Linter-style workflows that matter most for linked-PDF management: using an item's DOI to query Crossref and refresh publication metadata such as date, volume, issue, and pages. The pain point is that DOI-based imports and publisher metadata are often incomplete or inconsistent; ZotLink will treat Crossref lookup as a focused repair step rather than a general-purpose linting system.
 
 ZotLink 后续计划吸收 Linter 类工作流中最适合链接附件管理的一部分：通过条目的 DOI 查询 Crossref，并更新日期、Volume、Issue 和页码等出版信息。痛点在于 DOI 导入和出版社元数据常常不完整或不一致；ZotLink 会把 Crossref 查询作为聚焦的修复步骤，而不是做成完整的通用 Linter 系统。
 
-The extractor currently follows patterns tested from the earlier `handytool.pdf.extract_article_history` prototype and records known publisher layouts in [ARTICLE_HISTORY_FORMATS.md](ARTICLE_HISTORY_FORMATS.md).
+### Correct a PDF DOI Manually 手动修正 PDF DOI
 
-当前提取器参考了早期 `handytool.pdf.extract_article_history` 原型中已经验证过的思路；已知出版社排版格式记录在 [ARTICLE_HISTORY_FORMATS.md](ARTICLE_HISTORY_FORMATS.md)。
+If automatic DOI detection is incorrect, edit the PDF's custom metadata in a PDF editor. In Adobe Acrobat, open File > Properties (`Ctrl+D`) > Custom. Enter `doi` as the Name and the correct bare DOI as the Value, for example `10.1000/example` (without `https://doi.org/`). Click Add or Change, then OK, and save the PDF file. Run the Windows PDF context command `ZotLink > Update DOI metadata only` again: it uses the corrected `doi` and updates the corresponding `doiURL` rather than searching the page text again.
+
+如果 DOI 自动识别错误，可用 PDF 编辑器手动修改 PDF 的自定义元数据。例如在 Adobe Acrobat 中，点击“文件 → 属性（Ctrl+D）→ 自定义”，在“名称”中填写 `doi`，在“值”中填写正确的 DOI，例如 `10.1000/example`，不要带 `https://doi.org/`。点击“添加”或“更改”，再点击“确定”，并保存 PDF 文件。然后重新运行 Windows PDF 右键命令 `ZotLink > Update DOI metadata only`；它会使用修正后的 `doi` 更新对应的 `doiURL`，而不重新从页面文字中查找。
+
+After installing ZotLink, enabling the corresponding PDF processing options also applies the selected operations when a PDF is first dragged into Zotero and enters ZotLink's attachment processing workflow. Automatic metadata writing inside Zotero uses the parent item's DOI; correct that DOI too if necessary. This automatic workflow does not open the PDF editor or perform the manual correction for you.
+
+安装 ZotLink 后，若设置中已勾选相应 PDF 处理选项，首次将 PDF 拖入 Zotero 并进入 ZotLink 附件处理流程时，也会自动执行已启用的操作。Zotero 内的自动元数据写入以父文献条目的 DOI 为依据，必要时也应修正文献条目的 DOI；自动流程不会代替用户打开 PDF 编辑器或手动纠错。
 
 ### Index Data 索引数据
 
@@ -230,7 +282,19 @@ Compared with [ZotMoov](https://github.com/wileyyugioh/zotmoov), ZotLink emphasi
 
 与 [ZotMoov](https://github.com/wileyyugioh/zotmoov) 相比，ZotLink 更强调移动文件而不是复制后删除，并记录 Windows 机内码用于修复。与 [Attanger](https://github.com/MuiseDestiny/zotero-attanger) 相比，ZotLink 的定位更窄，更聚焦链接文件身份、分类文件夹映射和多分类快捷方式分身。[ZotFile](https://github.com/jlegewie/zotfile) 是经典前辈；ZotLink 则聚焦 Zotero 10 的链接附件工作流。
 
-## Notes 注意事项
+## Usage Recommendations and Notes 使用建议与注意事项
+
+Keep an Internet connection available for operations that query Crossref, including citation-based renaming and Windows PDF page-label alignment. Inside Zotero, page alignment uses the parent item's existing page range instead; writing a locally available DOI also does not inherently need the network. The Windows helpers report connection failures, timeouts and service errors in the ZotLink completion notice and stop failed Crossref requests before modifying the PDF. Their connection timeout is 5 seconds and read timeout is 20 seconds, without automatic retries; these are not a total task-time limit.
+
+执行查询 Crossref 的操作时应保持联网，包括引用式重命名和 Windows 右键的页面标签对齐。Zotero 内页码对齐使用父条目已有页码范围；写入本地已有 DOI 本身也无需联网。Windows 助手遇到断网、超时或服务异常，会在 ZotLink 完成提示中说明，请求失败时停止，不修改 PDF。连接超时为 5 秒，读取超时为 20 秒，不自动重试；这并非整个任务的总时限。
+
+For first-time use, rebuild subcollections from local folders first, then import PDFs one folder at a time using `仅导入当前文件夹 PDF`. Avoid importing all PDFs in one large batch, which may cause long waits and an unresponsive interface.
+
+首次使用建议先根据本地文件夹重建子分类结构，再使用 `仅导入当前文件夹 PDF` 逐个文件夹导入。尽量避免一次性导入所有 PDF，以减少长时间等待与界面卡顿。
+
+Collection-folder imports are metadata-only: PDFs without DOI or ISBN metadata are skipped, not sent through whole-document recognition. The separate Windows PDF commands may search up to the first 20 pages for a missing DOI; use that fallback selectively rather than starting a large batch. There is currently no separate preference switch for page-text DOI discovery.
+
+分类文件夹导入只读元数据：没有 DOI 或 ISBN 元数据的 PDF 会跳过，不进行全文识别。独立的 Windows PDF 右键命令在缺少 DOI 字段时可能搜索前 20 页文字，建议仅对少量文件使用这种补救方式，不建议大批量启用。目前没有单独控制页面文字 DOI 查找的设置开关。
 
 ZotLink is currently Windows-oriented because Windows file ID, `.lnk` shortcuts, and NTFS move semantics are central to its workflow.
 
@@ -243,6 +307,10 @@ ZotLink 面向链接附件工作流。若你偏好 Zotero storage 文件附件�
 PDF metadata writing modifies PDF source files. Back up your attachment folder before running whole-library operations for the first time.
 
 PDF metadata 写回会修改 PDF 源文件。首次执行全库操作前，建议备份附件目录。
+
+Prefer complete publisher-provided PDFs that retain their original layout. Avoid files assembled from multiple sources, incomplete extracts, or heavily rearranged editions, as missing metadata or altered page structure may cause information extraction to fail or produce inaccurate results.
+
+建议优先导入出版社提供、保留原始排版的完整 PDF。尽量避免使用多来源拼接、内容缺失或大幅重排的版本，以减少因元数据缺失或页面结构变化导致的信息读取失败或识别偏差。
 
 ## Version Log 版本记录
 

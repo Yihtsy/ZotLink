@@ -1,3 +1,5 @@
 dist/
 *.xpi
+__pycache__/
+*.py[cod]
 

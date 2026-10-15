@@ -15,12 +15,12 @@ const entries = [
   "README.md",
   "USER_MANUAL.md",
 	"FUNCTIONS.md",
-	"ARTICLE_HISTORY_FORMATS.md",
 	"VERSION_LOG.md",
 	"bootstrap.js",
 	"prefs.js",
 	"defaults/preferences/prefs.js",
 	"content/zotlink.js",
+	"content/windows-folder.ps1",
 	"content/preferences.xhtml",
 	"icons/zotlink-48.png",
 	"icons/zotlink-96.png",
@@ -28,6 +28,16 @@ const entries = [
 	"locale/en-US/zotlink.ftl",
 	"locale/zh-CN/zotlink.ftl"
 ];
+
+const pdfHelperRoot = path.join(root, "content", "windows-pdf");
+function addPDFHelpers(dir) {
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const file = path.join(dir, entry.name);
+		if (entry.isDirectory() && entry.name !== "__pycache__") addPDFHelpers(file);
+		else if (entry.isFile() && /\.(py|md|txt)$/.test(entry.name)) entries.push(path.relative(root, file));
+	}
+}
+addPDFHelpers(pdfHelperRoot);
 
 fs.mkdirSync(dist, { recursive: true });
 writeZip(outPath, entries.map(name => ({

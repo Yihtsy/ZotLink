@@ -24,6 +24,9 @@ async function shutdown(data, reason) {
 	if (reason === APP_SHUTDOWN) {
 		return;
 	}
+	if (reason === ADDON_UNINSTALL || reason === ADDON_DISABLE) {
+		await Zotero.ZotLink?.removeWindowsFolderMenu();
+	}
 
 	for (let win of Zotero.getMainWindows()) {
 		Zotero.ZotLink?.onMainWindowUnload(win);
@@ -34,7 +37,16 @@ async function shutdown(data, reason) {
 	ZotLinkData = null;
 }
 
-function uninstall() {}
+async function uninstall(data, reason) {
+	if (reason !== ADDON_UNINSTALL || !Zotero.isWin) return;
+	if (!Zotero.ZotLink) {
+		Services.scriptloader.loadSubScript(data.rootURI + "content/zotlink.js", Zotero.getMainWindow());
+		try { await Zotero.ZotLink.removeWindowsFolderMenu(); }
+		finally { delete Zotero.ZotLink; }
+	} else {
+		await Zotero.ZotLink.removeWindowsFolderMenu();
+	}
+}
 
 function onMainWindowLoad({ window }) {
 	Zotero.ZotLink?.onMainWindowLoad(window);

@@ -1,11 +1,13 @@
 {
   "name": "zotlink",
-  "version": "0.4.0",
+  "version": "0.8.0",
   "private": true,
   "author": "Yihtsy <yihtsy@outlook.com>",
   "license": "MIT",
   "description": "Zotero plugin for linked attachment moving, shortcut mirrors, and link repair.",
-  "scripts": {
-    "build": "node scripts/build-xpi.js"
-  }
+	"scripts": {
+		"build": "node scripts/build-xpi.js",
+		"test:doi": "node scripts/test-doi-extraction.js",
+		"test:drag": "node scripts/test-drag-source.js"
+	}
 }
